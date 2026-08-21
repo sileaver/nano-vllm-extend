@@ -6,6 +6,8 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.gpu_state import GpuStateTable
+from nanovllm.engine.gpu_prepare import gather_batch_inputs
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -19,6 +21,7 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
+        self.use_gpu_prepare = config.gpu_prepare
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -28,6 +31,19 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
+
+        # ── GPU-native state table (MRV2-style persistent batch) ──
+        if self.use_gpu_prepare:
+            max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+            self.gpu_state = GpuStateTable(
+                max_num_reqs=config.max_num_seqs,
+                max_model_len=config.max_model_len,
+                max_num_blocks=max_num_blocks,
+                block_size=self.block_size,
+            )
+        else:
+            self.gpu_state = None
+
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
@@ -133,13 +149,87 @@ class ModelRunner:
     # (query length = 1) in a single forward pass via varlen attention.
     # ------------------------------------------------------------------
 
-    def prepare_batch(self, seqs: list[Sequence]):
-        """Build input tensors for a (possibly mixed) batch.
+    # ------------------------------------------------------------------
+    # Batch preparation — dispatches between CPU (legacy) and GPU-native
+    # ------------------------------------------------------------------
 
-        Returns (input_ids, positions, is_uniform_decode) where
-        ``is_uniform_decode`` is True when every sequence is a decode
-        step — enabling the CUDA-graph fast path.
-        """
+    def prepare_batch(self, seqs: list[Sequence]):
+        if self.use_gpu_prepare and self.gpu_state is not None:
+            return self._prepare_batch_gpu(seqs)
+        else:
+            return self._prepare_batch_cpu(seqs)
+
+    def _sync_seq_to_gpu(self, seq: Sequence):
+        """Ensure GPU state table is up-to-date for *seq*."""
+        if not hasattr(seq, '_gpu_row'):
+            row = self.gpu_state.alloc_row()
+            seq._gpu_row = row
+            self.gpu_state.add_request(seq, row)
+        else:
+            self.gpu_state.update(seq)
+            # Token ids change during prefill (chunk by chunk), so sync
+            # the full array when in prefill mode.
+            if seq.is_prefill:
+                self.gpu_state.update_token_ids(seq)
+
+    def _prepare_batch_gpu(self, seqs: list[Sequence]):
+        """GPU-native: Triton kernel gathers inputs from persistent table."""
+        # ── Sync CPU → GPU state (metadata only, O(batch_size)) ──
+        for seq in seqs:
+            self._sync_seq_to_gpu(seq)
+
+        batch_size = len(seqs)
+
+        # ── Build batch-metadata tensors (small, on GPU) ────────
+        seq_indices = torch.tensor(
+            [seq._gpu_row for seq in seqs], dtype=torch.int32, device="cuda"
+        )
+        num_cached = torch.tensor(
+            [seq.num_cached_tokens for seq in seqs], dtype=torch.int32, device="cuda"
+        )
+        num_computed = torch.tensor(
+            [seq.num_computed_tokens for seq in seqs], dtype=torch.int32, device="cuda"
+        )
+        is_prefill = torch.tensor(
+            [seq.is_prefill for seq in seqs], dtype=torch.int32, device="cuda"
+        )
+        sched_tokens = torch.tensor(
+            [seq.num_scheduled_tokens for seq in seqs], dtype=torch.int32, device="cuda"
+        )
+
+        # ── Launch Triton gather kernel ─────────────────────────
+        (input_ids, positions, slot_mapping,
+         cu_seqlens_q, cu_seqlens_k) = gather_batch_inputs(
+            seq_indices=seq_indices,
+            num_cached=num_cached,
+            num_computed=num_computed,
+            is_prefill=is_prefill,
+            sched_tokens=sched_tokens,
+            token_ids=self.gpu_state.token_ids,
+            block_table=self.gpu_state.block_table,
+            block_size=self.block_size,
+        )
+
+        # ── Compute max sequence lengths ────────────────────────
+        max_seqlen_q = int(sched_tokens.max().item()) if batch_size > 0 else 0
+        seqlen_k = torch.where(
+            is_prefill.bool(), num_cached + sched_tokens, num_computed
+        )
+        max_seqlen_k = int(seqlen_k.max().item()) if batch_size > 0 else 0
+        is_uniform_decode = (max_seqlen_q == 1)
+
+        # ── Block tables for flash-attn ─────────────────────────
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
+            block_tables = self.prepare_block_tables(seqs)
+        else:
+            block_tables = None
+
+        set_context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                    slot_mapping, block_tables)
+        return input_ids, positions, is_uniform_decode
+
+    def _prepare_batch_cpu(self, seqs: list[Sequence]):
+        """Original CPU loop (kept for reference / fallback)."""
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -151,15 +241,13 @@ class ModelRunner:
 
         for seq in seqs:
             if seq.is_prefill:
-                # Prefill chunk: variable-length contiguous tokens.
                 start = seq.num_cached_tokens
                 seqlen_q = seq.num_scheduled_tokens
                 end = start + seqlen_q
-                seqlen_k = end  # all cached + new tokens
+                seqlen_k = end
                 input_ids.extend(seq[start:end])
                 positions.extend(range(start, end))
             else:
-                # Decode: single token.
                 seqlen_q = 1
                 seqlen_k = seq.num_computed_tokens
                 input_ids.append(seq.last_token)
@@ -170,7 +258,7 @@ class ModelRunner:
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
 
-            if not seq.block_table:  # warmup (no block table yet)
+            if not seq.block_table:
                 continue
 
             for i in range(seq.num_scheduled_tokens):
@@ -184,9 +272,6 @@ class ModelRunner:
         is_uniform_decode = (max_seqlen_q == 1)
 
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
-            # Some sequences have cached KV context (prefix cache or
-            # decode) — build block tables so flash-attn can read from
-            # the paged cache.
             block_tables = self.prepare_block_tables(seqs)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -194,7 +279,8 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, block_tables)
+        set_context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                    slot_mapping, block_tables)
         return input_ids, positions, is_uniform_decode
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -271,6 +357,15 @@ class ModelRunner:
             token_ids = None
         reset_context()
         return token_ids
+
+    def free_finished_gpu_rows(self, seqs: list[Sequence]):
+        """Release GPU table rows for finished sequences."""
+        if self.gpu_state is None:
+            return
+        for seq in seqs:
+            if seq.is_finished and hasattr(seq, '_gpu_row'):
+                self.gpu_state.free_row(seq._gpu_row)
+                del seq._gpu_row
 
     # ------------------------------------------------------------------
     # CUDA graph capture (uniform-decode only)

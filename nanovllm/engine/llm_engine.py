@@ -22,6 +22,7 @@ class LLMEngine:
         Sequence.block_size = config.kvcache_block_size
         self.async_scheduling = config.async_scheduling
         self.continuous_batching = config.continuous_batching
+        self.collect_timing = kwargs.get("collect_timing", False)
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -42,6 +43,8 @@ class LLMEngine:
 
         # Async scheduling state.
         self._pending_seqs: list[Sequence] | None = None
+        # Timing collection.
+        self._finished_seqs: list[Sequence] = []
 
     def exit(self):
         self.model_runner.call("exit")
@@ -53,7 +56,16 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        if self.collect_timing:
+            import time
+            seq.timing = True
+            seq.arrival_time = time.time()
+            self._finished_seqs.append(seq)
         self.scheduler.add(seq)
+
+    def reset_timing(self):
+        """Clear accumulated timing data (call after warmup)."""
+        self._finished_seqs.clear()
 
     # ------------------------------------------------------------------
     # Synchronous step
@@ -65,6 +77,7 @@ class LLMEngine:
         seqs = output.scheduled_seqs
         token_ids = self.model_runner.call("run", seqs)
         self.scheduler.postprocess(seqs, token_ids, output.is_prefill)
+        self.model_runner.call("free_finished_gpu_rows", seqs)
         finished = [
             (seq.seq_id, seq.completion_token_ids)
             for seq in seqs if seq.is_finished
@@ -92,6 +105,7 @@ class LLMEngine:
             self.model_runner.call("execute_model")
             token_ids = self.model_runner.call("sample")
             self.scheduler.update_from_output(seqs, token_ids, output.is_prefill)
+            self.model_runner.call("free_finished_gpu_rows", seqs)
             for seq in seqs:
                 if seq.is_finished:
                     all_finished.append((seq.seq_id, seq.completion_token_ids))
@@ -103,6 +117,7 @@ class LLMEngine:
                 self.scheduler.update_from_output(
                     self._pending_seqs, token_ids, False,
                 )
+                self.model_runner.call("free_finished_gpu_rows", self._pending_seqs)
                 for seq in self._pending_seqs:
                     if seq.is_finished:
                         all_finished.append((seq.seq_id, seq.completion_token_ids))
@@ -162,4 +177,28 @@ class LLMEngine:
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+
+        if self.collect_timing:
+            ttfts, tpots = [], []
+            for seq in self._finished_seqs:
+                if seq.first_token_time is not None and seq.arrival_time > 0:
+                    ttft = seq.first_token_time - seq.arrival_time
+                    ttfts.append(ttft)
+                if len(seq.token_times) >= 2:
+                    times = seq.token_times
+                    total_decode_time = times[-1] - times[0]
+                    tpot = total_decode_time / (len(times) - 1)
+                    tpots.append(tpot)
+            stats = {
+                "ttft_mean": sum(ttfts) / len(ttfts) if ttfts else 0,
+                "ttft_p50": sorted(ttfts)[len(ttfts)//2] if ttfts else 0,
+                "ttft_p99": sorted(ttfts)[int(len(ttfts)*0.99)] if ttfts else 0,
+                "tpot_mean": sum(tpots) / len(tpots) if tpots else 0,
+                "tpot_p50": sorted(tpots)[len(tpots)//2] if tpots else 0,
+                "tpot_p99": sorted(tpots)[int(len(tpots)*0.99)] if tpots else 0,
+                "num_requests": len(self._finished_seqs),
+            }
+            self._finished_seqs.clear()
+            return outputs, stats
+
         return outputs

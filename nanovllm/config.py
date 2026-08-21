@@ -14,6 +14,7 @@ class Config:
     enforce_eager: bool = False
     async_scheduling: bool = False
     continuous_batching: bool = False
+    gpu_prepare: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256

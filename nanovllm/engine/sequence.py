@@ -1,3 +1,4 @@
+import time
 from copy import copy
 from enum import Enum, auto
 from itertools import count
@@ -30,6 +31,11 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # Timing (opt-in, set by LLMEngine when collect_timing=True).
+        self.timing = False
+        self.arrival_time: float = 0.0
+        self.first_token_time: float | None = None
+        self.token_times: list[float] = []
 
     def __len__(self):
         return self.num_tokens
@@ -73,6 +79,11 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+        if self.timing:
+            now = time.time()
+            self.token_times.append(now)
+            if self.first_token_time is None:
+                self.first_token_time = now
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
