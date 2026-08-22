@@ -55,21 +55,50 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        # Draft-model layers (small-model speculative decoding) read their
+        # own KV cache: draft_slot_mapping / draft_block_tables instead of
+        # the target ones, and always use the flash_attn kernel (the
+        # flashinfer wrappers are planned for the target's head counts).
+        self.is_draft = False
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
 
+        if self.is_draft and context.draft_slot_mapping is not None:
+            slot_mapping = context.draft_slot_mapping
+            block_tables = context.draft_block_tables
+        else:
+            slot_mapping = context.slot_mapping
+            block_tables = context.block_tables
+
         # Step 1 — write new KV to paged cache at positions in slot_mapping.
         if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            store_kvcache(k, v, k_cache, v_cache, slot_mapping)
 
         # Step 2 — unified varlen attention for both prefill AND decode tokens.
         # When block_tables is available the KV cache is used as the
         # key/value source; otherwise the raw k/v tensors are used (e.g.
         # warmup with no block table).
-        if context.block_tables is not None:
+        if block_tables is not None:
             k, v = k_cache, v_cache
+
+        # FlashInfer backend: the batch is split into a decode part (one
+        # query token per seq) and a prefill part (variable-length chunks).
+        # Wrappers are planned once per step in ModelRunner.prepare_batch
+        # and shared by every layer; end_forward happens in reset_context.
+        if not self.is_draft and (
+                context.flashinfer_decode is not None
+                or context.flashinfer_prefill is not None):
+            nd = context.num_decode_tokens
+            if nd == 0:
+                return context.flashinfer_prefill.run(q, (k_cache, v_cache))
+            if nd == q.size(0):
+                return context.flashinfer_decode.run(q, (k_cache, v_cache))
+            return torch.cat((
+                context.flashinfer_decode.run(q[:nd], (k_cache, v_cache)),
+                context.flashinfer_prefill.run(q[nd:], (k_cache, v_cache)),
+            ))
 
         o = flash_attn_varlen_func(
             q, k, v,
@@ -79,6 +108,6 @@ class Attention(nn.Module):
             cu_seqlens_k=context.cu_seqlens_k,
             softmax_scale=self.scale,
             causal=True,
-            block_table=context.block_tables,
+            block_table=block_tables,
         )
         return o

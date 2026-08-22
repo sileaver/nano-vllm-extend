@@ -16,6 +16,7 @@ class SchedulerOutput:
     scheduled_seqs: list[Sequence]
     num_scheduled_tokens: int   # total tokens across all seqs this step
     is_prefill: bool            # True if ANY seq is a prefill chunk
+    is_speculative: bool = False  # pure-decode step with speculative decoding
 
 
 class Scheduler:
@@ -26,15 +27,43 @@ class Scheduler:
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        # Second KV space for the small draft model (spec_draft_model).
+        # num_draft_kvcache_blocks is computed by ModelRunner.__init__
+        # (which runs before the scheduler is constructed).
+        self.draft_block_manager = (
+            BlockManager(config.num_draft_kvcache_blocks, config.kvcache_block_size,
+                         block_table_attr="draft_block_table")
+            if config.num_draft_kvcache_blocks > 0 else None)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.continuous_batching = config.continuous_batching
+        self.num_spec_tokens = config.num_spec_tokens
+        # Speculative acceptance statistics.
+        self.spec_accepted = 0
+        self.spec_attempted = 0
 
     def is_finished(self):
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
+
+    # ------------------------------------------------------------------
+    # Dual-KV helpers (target + optional draft model)
+    # ------------------------------------------------------------------
+
+    def _can_append_all(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
+        if not self.block_manager.can_append(seq, num_new_tokens):
+            return False
+        if self.draft_block_manager is not None \
+                and not self.draft_block_manager.can_append(seq, num_new_tokens):
+            return False
+        return True
+
+    def _ensure_append_all(self, seq: Sequence, num_new_tokens: int = 1):
+        self.block_manager.ensure_append(seq, num_new_tokens)
+        if self.draft_block_manager is not None:
+            self.draft_block_manager.ensure_append(seq, num_new_tokens)
 
     # ------------------------------------------------------------------
     # Continuous batching (V1 style)
@@ -51,15 +80,17 @@ class Scheduler:
         """
         scheduled_seqs: list[Sequence] = []
         num_batched_tokens = 0
+        # Speculative decode steps schedule K+1 verified positions per seq.
+        ntok = self.num_spec_tokens + 1 if self.num_spec_tokens else 1
 
         # ── Phase 1: decode ──────────────────────────────────────
         for seq in list(self.running):
             if len(scheduled_seqs) >= self.max_num_seqs:
                 break
-            if num_batched_tokens + 1 > self.max_num_batched_tokens:
+            if num_batched_tokens + ntok > self.max_num_batched_tokens:
                 break
 
-            while not self.block_manager.can_append(seq):
+            while not self._can_append_all(seq, ntok):
                 if not self.running:
                     self.preempt(seq)
                     break
@@ -67,10 +98,10 @@ class Scheduler:
                 if self.running[-1] is seq:
                     break
             else:
-                seq.num_scheduled_tokens = 1
+                seq.num_scheduled_tokens = ntok
                 seq.is_prefill = False
-                self.block_manager.may_append(seq)
-                num_batched_tokens += 1
+                self._ensure_append_all(seq, ntok)
+                num_batched_tokens += ntok
                 scheduled_seqs.append(seq)
 
         # ── Phase 2: prefill chunks ──────────────────────────────
@@ -88,6 +119,10 @@ class Scheduler:
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
                 self.block_manager.allocate(seq, num_cached_blocks)
+                if self.draft_block_manager is not None:
+                    # Draft KV gets a plain (non-hashed) allocation.
+                    self.draft_block_manager.allocate(seq, 0)
+                    seq.num_cached_tokens = num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
 
@@ -134,6 +169,9 @@ class Scheduler:
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
+                if self.draft_block_manager is not None:
+                    self.draft_block_manager.allocate(seq, 0)
+                    seq.num_cached_tokens = num_cached_blocks * self.block_size
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
@@ -146,18 +184,19 @@ class Scheduler:
             return scheduled_seqs, num_batched_tokens, True
 
         # decode
+        ntok = self.num_spec_tokens + 1 if self.num_spec_tokens else 1
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self._can_append_all(seq, ntok):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
                     self.preempt(seq)
                     break
             else:
-                seq.num_scheduled_tokens = 1
+                seq.num_scheduled_tokens = ntok
                 seq.is_prefill = False
-                self.block_manager.may_append(seq)
+                self._ensure_append_all(seq, ntok)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
@@ -172,12 +211,23 @@ class Scheduler:
             seqs, num_tokens, has_prefill = self._schedule_continuous()
         else:
             seqs, num_tokens, has_prefill = self._schedule_legacy()
-        return SchedulerOutput(seqs, num_tokens, has_prefill)
+        is_speculative = bool(self.num_spec_tokens) and not has_prefill and bool(seqs)
+        if self.num_spec_tokens and has_prefill:
+            # Mixed batch: decode seqs were scheduled with K+1 tokens for
+            # speculative execution, but a prefill chunk is present so the
+            # standard path runs instead — reset to 1 or postprocess would
+            # advance num_cached_tokens by K+1 while appending one token.
+            for seq in seqs:
+                if not seq.is_prefill:
+                    seq.num_scheduled_tokens = 1
+        return SchedulerOutput(seqs, num_tokens, has_prefill, is_speculative)
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
+        if self.draft_block_manager is not None:
+            self.draft_block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
@@ -193,4 +243,55 @@ class Scheduler:
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
+                if self.draft_block_manager is not None:
+                    self.draft_block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    def postprocess_speculative(
+        self,
+        seqs: list[Sequence],
+        accepted: list[list[int]],
+    ) -> int:
+        """Apply accepted tokens from a speculative step (variable length
+        per seq).  Returns the total number of appended tokens.
+        """
+        total = 0
+        for seq, tokens in zip(seqs, accepted):
+            appended = 0
+            finished = False
+            for token_id in tokens:
+                seq.append_token(token_id)
+                appended += 1
+                if (not seq.ignore_eos and token_id == self.eos) \
+                        or seq.num_completion_tokens == seq.max_tokens:
+                    finished = True
+                    break
+            # Hash and advance KV by the *actual* accepted count (may be
+            # cut short by eos / max_tokens).  Must run after append_token
+            # (hash reads token_ids) and before num_cached_tokens advances
+            # (hash_blocks derives the block range from the old value).
+            self.block_manager.hash_blocks(seq, appended)
+            seq.num_cached_tokens += appended
+            seq.num_scheduled_tokens = 0
+            if finished:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                if self.draft_block_manager is not None:
+                    self.draft_block_manager.deallocate(seq)
+                self.running.remove(seq)
+            # Acceptance stats: position 0 (t_0) is always accepted and not
+            # a draft token — count draft acceptances only (appended - 1),
+            # against the K draft tokens this step attempted.
+            self.spec_accepted += appended - 1
+            self.spec_attempted += self.num_spec_tokens
+            total += appended
+        return total
+
+    def spec_stats(self) -> dict:
+        """Acceptance statistics for the current speculative run."""
+        return {
+            "accepted": self.spec_accepted,
+            "attempted": self.spec_attempted,
+            "accept_rate": self.spec_accepted / self.spec_attempted
+            if self.spec_attempted else 0.0,
+        }

@@ -25,8 +25,10 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int,
+                 block_table_attr: str = "block_table"):
         self.block_size = block_size
+        self.block_table_attr = block_table_attr
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
@@ -73,7 +75,8 @@ class BlockManager:
         return num_cached_blocks
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
-        assert not seq.block_table
+        table = getattr(seq, self.block_table_attr)
+        assert not table
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
@@ -86,28 +89,41 @@ class BlockManager:
                 block.ref_count = 1
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
-            seq.block_table.append(block_id)
+            table.append(block_id)
         for i in range(num_cached_blocks, seq.num_blocks):
-            seq.block_table.append(self._allocate_block())
+            table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
     def deallocate(self, seq: Sequence):
-        for block_id in reversed(seq.block_table):
+        table = getattr(seq, self.block_table_attr)
+        for block_id in reversed(table):
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
-        seq.block_table.clear()
+        table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
+    def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         # ``num_computed_tokens`` is the next free KV-cache position (0-indexed).
-        # When it's exactly at a block boundary we need a new block.
-        return len(self.free_block_ids) >= (seq.num_computed_tokens % self.block_size == 0)
+        # Speculative steps may need several new positions at once; the block
+        # table is a minimal cover of num_computed_tokens, so the missing
+        # block count is the cover size of the extended range minus its length.
+        table = getattr(seq, self.block_table_attr)
+        need = (seq.num_computed_tokens + num_new_tokens - 1) // self.block_size + 1 - len(table)
+        return len(self.free_block_ids) >= max(0, need)
 
     def may_append(self, seq: Sequence):
         if seq.num_computed_tokens % self.block_size == 0:
-            seq.block_table.append(self._allocate_block())
+            getattr(seq, self.block_table_attr).append(self._allocate_block())
+
+    def ensure_append(self, seq: Sequence, num_new_tokens: int = 1):
+        """Reserve blocks so the block table covers num_new_tokens new KV
+        positions (speculative decode writes K+1 slots per step)."""
+        table = getattr(seq, self.block_table_attr)
+        need = (seq.num_computed_tokens + num_new_tokens - 1) // self.block_size + 1 - len(table)
+        for _ in range(max(0, need)):
+            table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence, num_scheduled_tokens: int | None = None):
         if num_scheduled_tokens is None:
@@ -115,9 +131,10 @@ class BlockManager:
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + num_scheduled_tokens) // self.block_size
         if start == end: return
-        h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
+        table = getattr(seq, self.block_table_attr)
+        h = self.blocks[table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
-            block = self.blocks[seq.block_table[i]]
+            block = self.blocks[table[i]]
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)

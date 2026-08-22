@@ -18,6 +18,8 @@ def main():
         enforce_eager=False,
         max_model_len=4096,
         collect_timing=True
+        # sampling_backend="flashinfer"
+        # attention_backend="flashinfer"
     )
 
     prompt_token_ids = [

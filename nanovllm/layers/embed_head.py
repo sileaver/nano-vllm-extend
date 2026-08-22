@@ -53,13 +53,19 @@ class ParallelLMHead(VocabParallelEmbedding):
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
 
-    def forward(self, x: torch.Tensor):
-        context = get_context()
-        last_indices = context.cu_seqlens_q[1:] - 1
-        x = x[last_indices].contiguous()
+    def _logits(self, x: torch.Tensor) -> torch.Tensor:
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits
+
+    def forward(self, x: torch.Tensor):
+        context = get_context()
+        last_indices = context.cu_seqlens_q[1:] - 1
+        x = x[last_indices].contiguous()
+        return self._logits(x)
+
+    def forward_all(self, x: torch.Tensor):
+        return self._logits(x)

@@ -124,6 +124,10 @@ class Qwen3DecoderLayer(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
+        # transformers >= 5.x moves rope_theta into rope_parameters.
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            rope_theta = config.rope_parameters.get("rope_theta", 1000000.0)
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -132,7 +136,7 @@ class Qwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, 'attention_bias', True),
             head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
+            rope_theta=rope_theta,
             rope_scaling=getattr(config, "rope_scaling", None),
         )
         self.mlp = Qwen3MLP(
@@ -174,12 +178,35 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+        skip_layers: tuple[int, ...] | None = None,
+        output_layer_hidden: list[int] | None = None,
+    ):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        layer_hidden = []
+        for idx, layer in enumerate(self.layers):
+            if skip_layers is not None and idx in skip_layers:
+                # Layer-skipped draft (self-speculative).  The fused
+                # residual chain (hidden_states/residual) is untouched, so
+                # the skipped layer's input feeds the next layer unchanged.
+                # NOTE: measured on Qwen3-0.6B, skipping even 1 layer drops
+                # the draft-vs-target match rate from ~0.5 to ~0.14 — the
+                # model has no layer redundancy.  Kept as a general model
+                # capability; the speculative path uses Jacobi drafts.
+                continue
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if output_layer_hidden is not None and idx in output_layer_hidden:
+                # DFlash draft context: collect selected layer outputs
+                # (0-indexed, matching the target_layer_ids semantics).
+                # In the fused chain the residual accumulates attention AND
+                # previous MLP outputs (both layernorms fold their input
+                # into the residual), so residual + hidden_states (this
+                # layer's raw MLP output) is the full residual sum — the
+                # layer output as transformers reports it.
+                layer_hidden.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if output_layer_hidden is not None:
+            return hidden_states, torch.cat(layer_hidden, dim=-1)
         return hidden_states
 
 
@@ -206,11 +233,21 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        skip_layers: tuple[int, ...] | None = None,
+        output_layer_hidden: list[int] | None = None,
+    ):
+        return self.model(input_ids, positions, skip_layers, output_layer_hidden)
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def compute_all_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Logits for *every* row (speculative verification needs K+1 rows
+        per seq; the regular head gathers only the last row per seq)."""
+        return self.lm_head.forward_all(hidden_states)

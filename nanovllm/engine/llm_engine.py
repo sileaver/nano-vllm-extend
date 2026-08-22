@@ -35,6 +35,9 @@ class LLMEngine:
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
+        if config.num_spec_tokens > 0:
+            assert not config.async_scheduling, \
+                "spec v1: async_scheduling unsupported with speculative decoding"
         if self.async_scheduling:
             self.scheduler = AsyncScheduler(config)
         else:
@@ -47,6 +50,9 @@ class LLMEngine:
         self._finished_seqs: list[Sequence] = []
 
     def exit(self):
+        # Idempotent: atexit fires again after a manual exit().
+        if not hasattr(self, "model_runner"):
+            return
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -75,14 +81,23 @@ class LLMEngine:
         """Schedule → execute → postprocess (continuous or legacy)."""
         output: SchedulerOutput = self.scheduler.schedule()
         seqs = output.scheduled_seqs
-        token_ids = self.model_runner.call("run", seqs)
-        self.scheduler.postprocess(seqs, token_ids, output.is_prefill)
+        if output.is_speculative:
+            accepted = self.model_runner.call("run_speculative", seqs)
+            num_tokens = self.scheduler.postprocess_speculative(seqs, accepted)
+            # Report the *accepted* token count (decode semantics: negative),
+            # not the K+1 verified positions — otherwise Decode tok/s would
+            # be inflated by the draft width.
+            num_tokens = -num_tokens
+        else:
+            token_ids = self.model_runner.call("run", seqs)
+            self.scheduler.postprocess(seqs, token_ids, output.is_prefill)
+            num_tokens = output.num_scheduled_tokens
         self.model_runner.call("free_finished_gpu_rows", seqs)
         finished = [
             (seq.seq_id, seq.completion_token_ids)
             for seq in seqs if seq.is_finished
         ]
-        return finished, output.num_scheduled_tokens
+        return finished, num_tokens
 
     # ------------------------------------------------------------------
     # Asynchronous step
