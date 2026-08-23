@@ -222,8 +222,12 @@ class ModelRunner:
         if self.linear_s_pool is not None:
             # 纯 torch chunk kernel 跑超长 warmup 太慢 (18 层 fp32 chunk 循环);
             # warmup 只为预热分配器与 compile 缓存, 2048 token 足够.
+            # 单个 seq 即可: 多 seq 并发 chunk 的 fp32 中间张量峰值会被
+            # allocate_kv_cache 的 peak-memory 扣减吃掉数 GB 的 KV 预算.
             seq_len = min(seq_len, 2048)
-        num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
+            num_seqs = 1
+        else:
+            num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
@@ -278,8 +282,15 @@ class ModelRunner:
             config.num_kvcache_blocks = num_blocks
             config.num_draft_kvcache_blocks = num_blocks
         else:
+            # Activation headroom: the warmup forward (a single small batch)
+            # does not capture the transient peak of a full
+            # max_num_batched_tokens prefill step (~128KB/token across the
+            # layers); without reserving it the first big prefill OOMs into
+            # an allocator retry livelock.
+            headroom = config.max_num_batched_tokens * 128 * 1024 if self.linear_s_pool is not None else 0
             config.num_kvcache_blocks = int(
-                total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+                total * config.gpu_memory_utilization - used - peak + current
+                - headroom) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, num_kv_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
@@ -568,11 +579,15 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor,
                   is_uniform_decode: bool):
-        if not is_uniform_decode or self.enforce_eager or input_ids.size(0) > 512:
+        context = get_context()
+        # A single-token prompt's prefill has cu_k == cu_q, so no block
+        # tables are built (raw k/v is exactly the full KV there); the
+        # graph-replay path needs them — fall back to eager for that step.
+        if (not is_uniform_decode or self.enforce_eager or input_ids.size(0) > 512
+                or context.block_tables is None):
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
-            context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
@@ -1026,6 +1041,11 @@ class ModelRunner:
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # The 16-step sequence ends at the last multiple of 16 <= max_bs;
+        # cover the remainder (e.g. max_num_seqs clamped to 218 by the
+        # state pool) so lookups of bs in (208, 218] find a graph.
+        if self.graph_bs[-1] < max_bs:
+            self.graph_bs.append(max_bs)
         graphs = {}
         if not is_draft:
             # First graph set creates the memory pool; the draft set

@@ -11,8 +11,8 @@ def main():
     max_input_len = 1024
     max_output_len = 1024
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-
+    # path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.path.expanduser("~/huggingface/Qwen3.5-2B/")
     llm = LLM(
         model=path,
         enforce_eager=False,

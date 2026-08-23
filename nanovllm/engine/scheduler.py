@@ -121,7 +121,11 @@ class Scheduler:
                 scheduled_seqs.append(seq)
 
         # ── Phase 2: prefill chunks ──────────────────────────────
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+        # Cap the total active (running) sequences at max_num_seqs: without
+        # this the prefill loop admits every waiting request and running
+        # outgrows the per-step scheduling cap, starving the tail.
+        while self.waiting and len(scheduled_seqs) < self.max_num_seqs \
+                and len(self.running) < self.max_num_seqs:
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
                 break
@@ -170,7 +174,10 @@ class Scheduler:
         num_batched_tokens = 0
 
         # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+        # (running-count cap: see the note in _schedule_continuous — running
+        # beyond max_num_seqs starves the queue tail under this scheduler)
+        while self.waiting and len(scheduled_seqs) < self.max_num_seqs \
+                and len(self.running) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
@@ -217,7 +224,11 @@ class Scheduler:
                 self._ensure_append_all(seq, ntok)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
+        # Round-robin: re-queue at the TAIL.  extendleft(reversed(...)) puts
+        # the scheduled batch back at the head, so whenever running exceeds
+        # max_num_seqs the queue tail is never scheduled (starvation → the
+        # engine never finishes).
+        self.running.extend(scheduled_seqs)
         return scheduled_seqs, -len(scheduled_seqs), False
 
     # ------------------------------------------------------------------

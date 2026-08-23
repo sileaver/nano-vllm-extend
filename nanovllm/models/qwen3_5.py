@@ -32,6 +32,31 @@ from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.utils.context import get_context
 
+# Triton gated-delta kernels (fla / flash-linear-attention) when available —
+# numerically equivalent to the torch reference below (~1e-3 bf16 diff) but
+# fused: the torch chunk loop costs ~150us/tok and the torch decode step
+# ~30 kernel launches per layer.  Falls back to the pure-torch ports when
+# fla is not installed.
+try:
+    from fla.ops.gated_delta_rule import (
+        chunk_gated_delta_rule as _fla_chunk,
+        fused_recurrent_gated_delta_rule as _fla_recurrent,
+    )
+    _HAS_FLA = True
+except ImportError:
+    _fla_chunk = _fla_recurrent = None
+    _HAS_FLA = False
+
+# Kernel selection (env-overridable A/B switches).  Measured on RTX 5080
+# (bench_qwen35, 64-seq mixed load, cudagraph): the triton recurrent wins
+# inside the decode graph (no launch overhead, less GPU time), but the
+# triton chunk's ~0.56ms/call Python launcher overhead makes eager prefill
+# CPU-bound and 44% slower end-to-end despite 4.7x faster kernels — so the
+# torch chunk stays the default.  FLA_CHUNK=1 / FLA_RECURRENT=0 override.
+import os as _os
+_USE_FLA_RECURRENT = _HAS_FLA and _os.environ.get("FLA_RECURRENT", "1") == "1"
+_USE_FLA_CHUNK = _HAS_FLA and _os.environ.get("FLA_CHUNK", "0") == "1"
+
 
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6):
     """Matches the l2norm used inside the fla kernels."""
@@ -41,6 +66,18 @@ def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6):
 
 def chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64,
                            initial_state=None):
+    """Chunked gated delta rule: fla triton kernel when installed, else the
+    pure-torch port below.  Signature/semantics identical either way."""
+    if _USE_FLA_CHUNK:
+        return _fla_chunk(query, key, value, g=g, beta=beta,
+                          initial_state=initial_state, output_final_state=True,
+                          use_qk_l2norm_in_kernel=True)
+    return _torch_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size,
+                                         initial_state)
+
+
+def _torch_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64,
+                                  initial_state=None):
     """Chunked gated delta rule (port of transformers' torch version).
 
     query/key [B, T, HK, K], value [B, T, HV, V], beta/g [B, T, HV] in the
@@ -117,8 +154,20 @@ def chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64,
     return core_out, last_state
 
 
-@torch.compile
 def recurrent_gated_delta_rule(query, key, value, g, beta, initial_state=None):
+    """Single-step gated delta rule: fla triton kernel when installed, else
+    the pure-torch port below."""
+    if _USE_FLA_RECURRENT:
+        return _fla_recurrent(query, key, value, g=g, beta=beta,
+                              initial_state=initial_state, output_final_state=True,
+                              use_qk_l2norm_in_kernel=True)
+    return _torch_recurrent_gated_delta_rule(query, key, value, g, beta,
+                                             initial_state)
+
+
+@torch.compile
+def _torch_recurrent_gated_delta_rule(query, key, value, g, beta,
+                                      initial_state=None):
     """Single-step gated delta rule (port of transformers' torch version).
 
     query/key [B, 1, HK, K], value [B, 1, HV, V], beta/g [B, 1, HV].
@@ -323,6 +372,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.s_cache: torch.Tensor | None = None      # [slots, H, K, V] fp32
         self.conv_cache: torch.Tensor | None = None   # [slots, conv_dim, kernel-1]
 
+    # Chunk-kernel call budget (padded tokens per call): the pure-torch
+    # kernel's fp32 intermediates need ~150MB per 1k padded tokens, so one
+    # call over a full 16k-token engine batch demands multi-GB transient
+    # peaks — with a large KV pool that leaves no headroom and the
+    # allocator livelocks in OOM-retry.  Segments thread the recurrent/
+    # conv state, so splitting is exactly equivalent to one call.
+    PREFILL_SEGMENT_TOKENS = 4096
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -346,46 +403,65 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             x = hidden_states.new_zeros(bs, T, H)
             x[mask] = hidden_states
 
-        mixed = self.in_proj_qkv(x).transpose(1, 2)       # [bs, conv_dim, T]
-        z = self.in_proj_z(x)                             # [bs, T, value_dim]
         b = self.in_proj_b(x)                             # [bs, T, H]
         a = self.in_proj_a(x)                             # [bs, T, H]
-        conv_states = self.conv_cache[ids]                # [bs, conv_dim, k-1]
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
         conv_w = self.conv1d.weight                       # [conv_dim, 1, k]
+
+        def split_qkv(mixed, n):
+            q, k, v = mixed.split([self.key_dim, self.key_dim, self.value_dim], dim=1)
+            q = q.transpose(1, 2).reshape(bs, n, self.num_k_heads, self.head_k_dim)
+            k = k.transpose(1, 2).reshape(bs, n, self.num_k_heads, self.head_k_dim)
+            v = v.transpose(1, 2).reshape(bs, n, self.num_v_heads, self.head_v_dim)
+            if self.num_v_heads > self.num_k_heads:
+                rep = self.num_v_heads // self.num_k_heads
+                q = q.repeat_interleave(rep, dim=2)
+                k = k.repeat_interleave(rep, dim=2)
+            return q, k, v
 
         if T == 1:
             # Decode: roll the conv state and convolve the 4-token window.
-            window = torch.cat([conv_states, mixed], dim=-1)
+            mixed = self.in_proj_qkv(x).transpose(1, 2)   # [bs, conv_dim, 1]
+            window = torch.cat([self.conv_cache[ids], mixed], dim=-1)
             self.conv_cache[ids] = window[..., 1:]
             mixed = F.silu(F.conv1d(window, conv_w, groups=self.conv_dim))
+            q, k, v = split_qkv(mixed, 1)
+            z = self.in_proj_z(x)
+            out, new_s = recurrent_gated_delta_rule(q, k, v, g, beta, self.s_cache[ids])
+            self.s_cache[ids] = new_s
         else:
-            # Prefill / chunk continuation: prepend the conv state (all-zero
-            # on a fresh prefill — identical to zero left-padding).
-            window = torch.cat([conv_states, mixed], dim=-1)
-            mixed = F.silu(F.conv1d(window, conv_w, groups=self.conv_dim))
-            for b_i in range(bs):
-                r = int(lens[b_i])
-                # cat layout is [state(k-1), x(T)]: the last k-1 real columns
-                # start at index r (independent of padding rows).
-                self.conv_cache[ids[b_i]] = window[b_i, :, r:r + self.conv_kernel - 1]
-
-        q, k, v = mixed.split([self.key_dim, self.key_dim, self.value_dim], dim=1)
-        q = q.transpose(1, 2).reshape(bs, T, self.num_k_heads, self.head_k_dim)
-        k = k.transpose(1, 2).reshape(bs, T, self.num_k_heads, self.head_k_dim)
-        v = v.transpose(1, 2).reshape(bs, T, self.num_v_heads, self.head_v_dim)
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
-        if self.num_v_heads > self.num_k_heads:
-            rep = self.num_v_heads // self.num_k_heads
-            q = q.repeat_interleave(rep, dim=2)
-            k = k.repeat_interleave(rep, dim=2)
-
-        s0 = self.s_cache[ids]
-        if T == 1:
-            out, new_s = recurrent_gated_delta_rule(q, k, v, g, beta, s0)
-        else:
-            out, new_s = chunk_gated_delta_rule(q, k, v, g, beta, initial_state=s0)
-        self.s_cache[ids] = new_s
+            # Prefill / chunk continuation, in T-segments (see
+            # PREFILL_SEGMENT_TOKENS).  The conv state threads across
+            # segments; a zero state on the first segment of a fresh prefill
+            # is identical to the causal conv's zero left-padding.
+            z = self.in_proj_z(x)                         # [bs, T, value_dim]
+            seg = max(1, self.PREFILL_SEGMENT_TOKENS // bs)
+            conv_states = self.conv_cache[ids]            # [bs, conv_dim, k-1]
+            state = self.s_cache[ids]
+            outs = []
+            for t0 in range(0, T, seg):
+                t1 = min(t0 + seg, T)
+                n = t1 - t0
+                mixed = self.in_proj_qkv(x[:, t0:t1]).transpose(1, 2)
+                window = torch.cat([conv_states, mixed], dim=-1)
+                mixed = F.silu(F.conv1d(window, conv_w, groups=self.conv_dim))
+                # Per-seq conv-state writeback at the latest real position:
+                # window layout is [state(k-1), x(n)].
+                for b_i in range(bs):
+                    r = int(lens[b_i]) - t0
+                    if r >= n:
+                        self.conv_cache[ids[b_i]] = window[b_i, :, -3:]
+                    elif r > 0:
+                        self.conv_cache[ids[b_i]] = window[b_i, :, r:r + 3]
+                    # r <= 0: padding-only rows for this seq — keep its state
+                conv_states = window[..., -3:]
+                q, k, v = split_qkv(mixed, n)
+                out_i, state = chunk_gated_delta_rule(
+                    q, k, v, g[:, t0:t1], beta[:, t0:t1], initial_state=state)
+                outs.append(out_i)
+            self.s_cache[ids] = state
+            out = torch.cat(outs, dim=1)
 
         # Norm on the value head dim: keep the head dim explicit (weight is
         # [head_v_dim], shared across heads — matches the reference's
