@@ -70,6 +70,7 @@ class AsyncScheduler(Scheduler):
             ):
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
+                self._free_state_slot(seq)
                 self.running.remove(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):

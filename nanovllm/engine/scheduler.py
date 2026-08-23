@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.linear_state_pool import LinearStatePool
 
 
 @dataclass
@@ -34,6 +35,12 @@ class Scheduler:
             BlockManager(config.num_draft_kvcache_blocks, config.kvcache_block_size,
                          block_table_attr="draft_block_table")
             if config.num_draft_kvcache_blocks > 0 else None)
+        # Hybrid models: linear-attention recurrent-state slots.  Kept for
+        # the whole sequence lifetime (preemption keeps the slot — the
+        # recomputed prefill re-zeroes it via the fresh-prefill path).
+        self.state_pool = (
+            LinearStatePool(config.num_linear_state_slots)
+            if config.num_linear_state_slots > 0 else None)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.continuous_batching = config.continuous_batching
@@ -64,6 +71,15 @@ class Scheduler:
         self.block_manager.ensure_append(seq, num_new_tokens)
         if self.draft_block_manager is not None:
             self.draft_block_manager.ensure_append(seq, num_new_tokens)
+
+    def _alloc_state_slot(self, seq: Sequence):
+        if self.state_pool is not None and seq.linear_state_id == -1:
+            seq.linear_state_id = self.state_pool.alloc()
+
+    def _free_state_slot(self, seq: Sequence):
+        if self.state_pool is not None and seq.linear_state_id != -1:
+            self.state_pool.free(seq.linear_state_id)
+            seq.linear_state_id = -1
 
     # ------------------------------------------------------------------
     # Continuous batching (V1 style)
@@ -119,6 +135,7 @@ class Scheduler:
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
                 self.block_manager.allocate(seq, num_cached_blocks)
+                self._alloc_state_slot(seq)
                 if self.draft_block_manager is not None:
                     # Draft KV gets a plain (non-hashed) allocation.
                     self.draft_block_manager.allocate(seq, 0)
@@ -169,6 +186,7 @@ class Scheduler:
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
+                self._alloc_state_slot(seq)
                 if self.draft_block_manager is not None:
                     self.draft_block_manager.allocate(seq, 0)
                     seq.num_cached_tokens = num_cached_blocks * self.block_size
@@ -245,6 +263,7 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
                 if self.draft_block_manager is not None:
                     self.draft_block_manager.deallocate(seq)
+                self._free_state_slot(seq)
                 self.running.remove(seq)
 
     def postprocess_speculative(
@@ -278,6 +297,7 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
                 if self.draft_block_manager is not None:
                     self.draft_block_manager.deallocate(seq)
+                self._free_state_slot(seq)
                 self.running.remove(seq)
             # Acceptance stats: position 0 (t_0) is always accepted and not
             # a draft token — count draft acceptances only (appended - 1),

@@ -15,6 +15,8 @@ def apply_rotary_emb(
 
 
 class RotaryEmbedding(nn.Module):
+    # rotary_dim < head_size = partial RoPE (only the leading rotary_dim
+    # channels rotate; the rest pass through, e.g. Qwen3.5: 64 of 256).
 
     def __init__(
         self,
@@ -25,7 +27,7 @@ class RotaryEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.head_size = head_size
-        assert rotary_dim == head_size
+        self.rotary_dim = rotary_dim
         inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
@@ -43,8 +45,15 @@ class RotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
-        query = apply_rotary_emb(query, cos, sin)
-        key = apply_rotary_emb(key, cos, sin)
+        q_rot, k_rot = query[..., :self.rotary_dim], key[..., :self.rotary_dim]
+        q_rot = apply_rotary_emb(q_rot, cos, sin)
+        k_rot = apply_rotary_emb(k_rot, cos, sin)
+        if self.rotary_dim < self.head_size:
+            # Partial RoPE: the tail channels pass through unrotated.
+            query = torch.cat((q_rot, query[..., self.rotary_dim:]), dim=-1)
+            key = torch.cat((k_rot, key[..., self.rotary_dim:]), dim=-1)
+        else:
+            query, key = q_rot, k_rot
         return query, key
 
 

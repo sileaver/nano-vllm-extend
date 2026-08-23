@@ -21,6 +21,9 @@ class Context:
     # slot_mapping / block_tables.
     draft_slot_mapping: torch.Tensor | None = None
     draft_block_tables: torch.Tensor | None = None
+    # Hybrid models (linear attention layers): per-seq recurrent-state slot
+    # ids into the GatedDeltaNet state pools ([bs] int64).
+    linear_state_ids: torch.Tensor | None = None
 
 
 _CONTEXT = Context()
@@ -33,12 +36,14 @@ def get_context():
 def set_context(cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0,
                 slot_mapping=None, block_tables=None, num_decode_tokens=0,
                 flashinfer_decode=None, flashinfer_prefill=None,
-                draft_slot_mapping=None, draft_block_tables=None):
+                draft_slot_mapping=None, draft_block_tables=None,
+                linear_state_ids=None):
     global _CONTEXT
     _CONTEXT = Context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                        slot_mapping, block_tables, num_decode_tokens,
                        flashinfer_decode, flashinfer_prefill,
-                       draft_slot_mapping, draft_block_tables)
+                       draft_slot_mapping, draft_block_tables,
+                       linear_state_ids)
 
 
 def reset_context():

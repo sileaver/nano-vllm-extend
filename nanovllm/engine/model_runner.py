@@ -10,6 +10,7 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.gpu_state import GpuStateTable
 from nanovllm.engine.gpu_prepare import gather_batch_inputs
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.flashinfer_env import setup_flashinfer_env
@@ -61,8 +62,18 @@ class ModelRunner:
             self.flashinfer = None
             self._fi_workspace = None
 
-        self.model = Qwen3ForCausalLM(hf_config)
+        if "qwen3_5" in hf_config.model_type:
+            self.model = Qwen3_5ForCausalLM(hf_config)
+        else:
+            self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        # ── Hybrid models: linear-attention recurrent-state pools ──
+        # Allocated before warmup (the warmup forward consumes slots) and
+        # before the KV cache budget computation (the pools are resident).
+        self.linear_s_pool: torch.Tensor | None = None
+        self.linear_conv_pool: torch.Tensor | None = None
+        if any(hasattr(m, "s_cache") for m in self.model.modules()):
+            self._allocate_linear_state_pool()
         # ── Draft model (classic small-model or DFlash block diffusion) ──
         self.use_draft_model = bool(config.spec_draft_model)
         self.use_dflash_draft = False
@@ -156,16 +167,72 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    def _allocate_linear_state_pool(self):
+        """GPU pools for the gated-delta-net recurrent/conv states.
+
+        Layout: s_pool [slots, L, H, K, V] fp32 + conv_pool [slots, L,
+        conv_dim, k-1]; per-layer views are bound to the GatedDeltaNet
+        modules (same pattern as the paged-KV k/v_cache binding).  Slots
+        cost ~19.5 MB each on Qwen3.5-2B, so max_num_seqs is clamped to a
+        ~4 GB budget.
+        """
+        gdns = [m for m in self.model.modules() if hasattr(m, "s_cache")]
+        L = len(gdns)
+        m0 = gdns[0]
+        H, K, V = m0.num_v_heads, m0.head_k_dim, m0.head_v_dim
+        conv_dim, conv_states = m0.conv_dim, m0.conv_kernel - 1
+        per_slot = L * (H * K * V * 4 + conv_dim * conv_states * 2)
+        free, total = torch.cuda.mem_get_info()
+        budget = min(4 * 1024**3, int(total * 0.25))
+        num_slots = min(self.config.max_num_seqs, max(8, budget // per_slot))
+        self.config.max_num_seqs = min(self.config.max_num_seqs, num_slots)
+        self.config.num_linear_state_slots = num_slots
+        self.linear_s_pool = torch.zeros(num_slots, L, H, K, V,
+                                         dtype=torch.float32, device="cuda")
+        self.linear_conv_pool = torch.zeros(num_slots, L, conv_dim, conv_states,
+                                            device="cuda")
+        for layer_id, module in enumerate(gdns):
+            module.s_cache = self.linear_s_pool[:, layer_id]
+            module.conv_cache = self.linear_conv_pool[:, layer_id]
+
+    def reset_linear_states(self, slot_ids: torch.Tensor):
+        """Zero a slot's recurrent + conv state (fresh-prefill semantics)."""
+        self.linear_s_pool[slot_ids] = 0
+        self.linear_conv_pool[slot_ids] = 0
+
+    def _linear_state_context(self, seqs: list[Sequence]) -> torch.Tensor | None:
+        """Per-seq state slot ids for the context; fresh prefills (the
+        first chunk, or a recomputed prefill after preemption) get their
+        slots zeroed — a zero state IS the initial state."""
+        if self.linear_s_pool is None:
+            return None
+        fresh = [seq.linear_state_id for seq in seqs
+                 if seq.is_prefill and seq.num_cached_tokens == 0]
+        if fresh:
+            self.reset_linear_states(
+                torch.tensor(fresh, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True))
+        return torch.tensor([seq.linear_state_id for seq in seqs],
+                            dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
+        if self.linear_s_pool is not None:
+            # 纯 torch chunk kernel 跑超长 warmup 太慢 (18 层 fp32 chunk 循环);
+            # warmup 只为预热分配器与 compile 缓存, 2048 token 足够.
+            seq_len = min(seq_len, 2048)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
             seq.is_prefill = True
+        if self.linear_s_pool is not None:
+            # Warmup forwards need valid slots; borrow 0..num_seqs-1 (they
+            # are re-zeroed whenever a real sequence starts on them).
+            for i, seq in enumerate(seqs):
+                seq.linear_state_id = i
         self.run(seqs)
         if self.num_spec_tokens > 0:
             # Trigger inductor compilation of sample_with_probs so the
@@ -192,7 +259,11 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        # Hybrid models: only the full-attention layers hold paged KV.
+        layer_types = getattr(hf_config, "layer_types", None)
+        num_kv_layers = (sum(1 for t in layer_types if t != "linear_attention")
+                         if layer_types else hf_config.num_hidden_layers)
+        block_bytes = 2 * num_kv_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         if self.draft_model is not None and not self.use_dflash_draft:
             # Split the remaining budget between target and draft KV by
             # equal block COUNT (both caches hold the same tokens per seq).
@@ -210,7 +281,7 @@ class ModelRunner:
             config.num_kvcache_blocks = int(
                 total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, num_kv_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -409,8 +480,10 @@ class ModelRunner:
             block_tables = None
 
         num_decode, fi_decode, fi_prefill = self.plan_flashinfer(seqs)
+        linear_state_ids = self._linear_state_context(seqs)
         set_context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                    slot_mapping, block_tables, num_decode, fi_decode, fi_prefill)
+                    slot_mapping, block_tables, num_decode, fi_decode, fi_prefill,
+                    linear_state_ids=linear_state_ids)
         return input_ids, positions, is_uniform_decode
 
     def _prepare_batch_cpu(self, seqs: list[Sequence]):
@@ -469,8 +542,10 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         num_decode, fi_decode, fi_prefill = self.plan_flashinfer(seqs)
+        linear_state_ids = self._linear_state_context(seqs)
         set_context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                    slot_mapping, block_tables, num_decode, fi_decode, fi_prefill)
+                    slot_mapping, block_tables, num_decode, fi_decode, fi_prefill,
+                    linear_state_ids=linear_state_ids)
         return input_ids, positions, is_uniform_decode
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -509,6 +584,8 @@ class ModelRunner:
             graph_vars["cu_seqlens_k"].zero_()
             graph_vars["cu_seqlens_k"][:bs + 1] = context.cu_seqlens_k
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            if "linear_state_ids" in graph_vars:
+                graph_vars["linear_state_ids"][:bs] = context.linear_state_ids
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -517,6 +594,12 @@ class ModelRunner:
     # ------------------------------------------------------------------
 
     def run(self, seqs: list[Sequence]) -> list[int]:
+        if not seqs:
+            # Starved schedule (e.g. no sequence fits the KV pool): nothing
+            # to run this step.  An empty batch would break the hybrid
+            # model's conv window (max_seqlen_q == 0) and is pointless GPU
+            # work anyway.
+            return None
         input_ids, positions, is_uniform = self.prepare_batch(seqs)
         sample_params = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_uniform)
@@ -876,6 +959,8 @@ class ModelRunner:
 
     def prepare_step(self, seqs: list[Sequence]):
         """Phase 1: prepare metadata tensors and set global context."""
+        if not seqs:
+            return  # starved schedule — skip this step
         input_ids, positions, is_uniform = self.prepare_batch(seqs)
         self._async_input_ids = input_ids
         self._async_positions = positions
@@ -930,6 +1015,11 @@ class ModelRunner:
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
+        # Linear-attention state slot ids (hybrid models); the recurrent
+        # update inside the graph reads/writes fixed pool addresses, only
+        # this id buffer's contents change between replays.
+        linear_state_ids = (torch.zeros(max_bs, dtype=torch.int64)
+                            if self.linear_s_pool is not None else None)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         cu_seqlens_q = torch.zeros(max_bs + 1, dtype=torch.int32)
         cu_seqlens_k = torch.zeros(max_bs + 1, dtype=torch.int32)
@@ -957,7 +1047,9 @@ class ModelRunner:
             else:
                 set_context(cu_seqlens_q[:bs + 1], cu_seqlens_k[:bs + 1],
                             1, bs + 1,
-                            slot_mapping[:bs], block_tables[:bs])
+                            slot_mapping[:bs], block_tables[:bs],
+                            linear_state_ids=(linear_state_ids[:bs]
+                                              if linear_state_ids is not None else None))
             outputs[:bs] = model(input_ids[:bs], positions[:bs],
                                  skip_layers=skip_layers)  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
@@ -978,4 +1070,6 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+        if linear_state_ids is not None:
+            graph_vars["linear_state_ids"] = linear_state_ids
         return graphs, graph_vars

@@ -29,6 +29,9 @@ class Sequence:
         self.is_prefill = True
         self.block_table = []
         self.draft_block_table: list[int] = []
+        # Hybrid models: slot into the linear-attention recurrent-state pool
+        # (-1 = unallocated; assigned by the scheduler on first scheduling).
+        self.linear_state_id = -1
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
