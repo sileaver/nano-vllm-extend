@@ -1,6 +1,6 @@
+import re
 import torch
 from torch import nn
-import torch.distributed as dist
 from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
@@ -9,6 +9,23 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.utils.parallel import get_pp_rank, get_pp_size, get_tp_size
+
+
+class PipelineLayerShell(nn.Module):
+    """Placeholder for decoder layers owned by other pipeline stages.
+
+    Keeps ``model.layers.<i>`` name slots aligned with the checkpoint so
+    weight loading maps unchanged; holds no parameters and never runs."""
+    def forward(self, *args, **kwargs):
+        raise RuntimeError("pipeline layer shell must not be executed")
+
+
+def split_layers(num_layers: int, pp_size: int, pp_rank: int) -> tuple[int, int]:
+    """Contiguous, balanced layer range for one pipeline stage."""
+    per_stage = (num_layers + pp_size - 1) // pp_size
+    start = pp_rank * per_stage
+    return start, min(num_layers, start + per_stage)
 
 
 class Qwen3Attention(nn.Module):
@@ -26,7 +43,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: dict | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -170,9 +187,26 @@ class Qwen3Model(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.pp_first = get_pp_rank() == 0
+        self.pp_last = get_pp_rank() == get_pp_size() - 1
+        self.start_layer, self.end_layer = split_layers(
+            config.num_hidden_layers, get_pp_size(), get_pp_rank())
+        if self.pp_first:
+            self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        else:
+            self.embed_tokens = None
+        self.layers = nn.ModuleList([
+            Qwen3DecoderLayer(config) if self.start_layer <= i < self.end_layer
+            else PipelineLayerShell()
+            for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def checkpoint_skips(self, weight_name: str) -> bool:
+        """True for checkpoint weights this pipeline stage does not own."""
+        if self.embed_tokens is None and ".embed_tokens." in weight_name:
+            return True
+        m = re.search(r"\.layers\.(\d+)\.", weight_name)
+        return bool(m) and not (self.start_layer <= int(m.group(1)) < self.end_layer)
 
     def forward(
         self,
@@ -180,11 +214,16 @@ class Qwen3Model(nn.Module):
         positions: torch.Tensor,
         skip_layers: tuple[int, ...] | None = None,
         output_layer_hidden: list[int] | None = None,
+        hidden_states: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
     ):
-        hidden_states = self.embed_tokens(input_ids)
-        residual = None
+        if hidden_states is None:
+            hidden_states = self.embed_tokens(input_ids)
+            residual = None
         layer_hidden = []
         for idx, layer in enumerate(self.layers):
+            if isinstance(layer, PipelineLayerShell):
+                continue
             if skip_layers is not None and idx in skip_layers:
                 # Layer-skipped draft (self-speculative).  The fused
                 # residual chain (hidden_states/residual) is untouched, so
@@ -204,6 +243,9 @@ class Qwen3Model(nn.Module):
                 # layer's raw MLP output) is the full residual sum — the
                 # layer output as transformers reports it.
                 layer_hidden.append(hidden_states + residual)
+        if not self.pp_last:
+            # Intermediate pipeline stage: hand the fused-residual chain on.
+            return hidden_states, residual
         hidden_states, _ = self.norm(hidden_states, residual)
         if output_layer_hidden is not None:
             return hidden_states, torch.cat(layer_hidden, dim=-1)
@@ -225,9 +267,25 @@ class Qwen3ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.model = Qwen3Model(config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if config.tie_word_embeddings:
-            self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        self.pp_first, self.pp_last = self.model.pp_first, self.model.pp_last
+        if self.pp_last:
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+            if config.tie_word_embeddings and self.pp_first:
+                self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        else:
+            self.lm_head = None
+        # Tied embeddings across pipeline stages: the last stage has no
+        # embed_tokens to share storage with, so route the embed checkpoint
+        # entry into lm_head directly (its vocab-sharded loader applies).
+        self.checkpoint_aliases = (
+            {"model.embed_tokens.weight": "lm_head.weight"}
+            if config.tie_word_embeddings and self.lm_head is not None and not self.pp_first
+            else {})
+
+    def checkpoint_skips(self, weight_name: str) -> bool:
+        if self.model.checkpoint_skips(weight_name):
+            return True
+        return self.lm_head is None and weight_name.startswith("lm_head.")
 
     def forward(
         self,
@@ -235,13 +293,17 @@ class Qwen3ForCausalLM(nn.Module):
         positions: torch.Tensor,
         skip_layers: tuple[int, ...] | None = None,
         output_layer_hidden: list[int] | None = None,
+        hidden_states: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
     ):
-        return self.model(input_ids, positions, skip_layers, output_layer_hidden)
+        return self.model(input_ids, positions, skip_layers, output_layer_hidden,
+                          hidden_states, residual)
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        assert self.lm_head is not None, "compute_logits on a non-last pipeline stage"
         return self.lm_head(hidden_states)
 
     def compute_all_logits(

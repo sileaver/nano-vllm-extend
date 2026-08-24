@@ -14,7 +14,7 @@ A lightweight vLLM implementation built from scratch.
 
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+* ⚡ **Optimization Suite** - Prefix caching, Tensor/Pipeline/Data Parallelism, Torch compilation, CUDA graph, etc.
 
 ## Installation
 
@@ -42,6 +42,41 @@ prompts = ["Hello, Nano-vLLM."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
+
+## Parallelism (TP / PP / DP)
+
+The three strategies can be combined freely (`dp * pp * tp` ranks, one GPU
+per rank, single node).  Correctness was validated on 2x RTX 5090 against
+single-GPU runs: prefill argmax is token-identical across layouts
+(32/32 real prompts), and generation streams stay within the bf16
+implementation-noise floor (small models have near-tied logits; see
+`tests/real_prompt_check.py`, `tests/parallel_check.py`):
+
+```python
+llm = LLM(path, tensor_parallel_size=2)    # TP: shard heads/neurons per rank
+llm = LLM(path, pipeline_parallel_size=2)  # PP: split layers across stages
+llm = LLM(path, data_parallel_size=2)      # DP: replicas, each own scheduler
+```
+
+* **TP** shards attention/MLP projections, the vocab embedding, the hybrid
+  Qwen3.5 gated-delta-net heads (conv channels + recurrent state) and the
+  KV cache.  Communication: one all-reduce per layer.
+* **PP** splits decoder layers across stages (`dist.send/recv` of the fused
+  hidden+residual chain between stage peers).  Each stage owns only its
+  layers' KV cache / recurrent-state pools — roughly halves per-GPU memory
+  at pp=2.  KV-block and state-slot counts are min-synced across stages so
+  the rank-0 scheduler stays consistent.  Decode CUDA graphs are captured
+  per stage.  v1 runs one batch through the pipeline synchronously (no
+  micro-batch overlap) — use it for capacity, not latency.
+* **DP** replicates the whole engine (scheduler + runners) per GPU group;
+  the driver LPT-bin-packs requests and merges results in order.  Best for
+  offline throughput when the load exceeds one replica's concurrency —
+  measured 1.94x on 512 ragged requests over 2x RTX 5090 (vs 1.38x at 256
+  requests where each replica is batch-starved).
+
+Speculative decoding requires `tp = pp = 1` (it can run under DP — each
+replica speculates independently).  `collect_timing` and step-level
+`add_request`/`step` streaming are single-group only.
 
 ## Speculative Decoding
 

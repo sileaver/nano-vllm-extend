@@ -19,18 +19,26 @@ per-step slot ids come from ``context.linear_state_ids``.  A fresh prefill
 is encoded by zeroing the slot: a zero conv_state is mathematically the
 zero left-padding the causal conv would apply anyway, and a zero S is the
 null initial recurrent state — so no branch is needed.
+
+Tensor parallelism shards every projection, the conv channels and the
+recurrent state at v-head granularity (see Qwen3_5GatedDeltaNet); pipeline
+parallelism splits the 24 layers across stages (see Qwen3_5Model).
 """
+import re
 import torch
 import torch.nn.functional as F
 from torch import nn
-import torch.distributed as dist
+import triton
+import triton.language as tl
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.models.qwen3 import PipelineLayerShell, split_layers
 from nanovllm.utils.context import get_context
+from nanovllm.utils.parallel import get_pp_rank, get_pp_size, get_tp_rank, get_tp_size
 
 # Triton gated-delta kernels (fla / flash-linear-attention) when available —
 # numerically equivalent to the torch reference below (~1e-3 bf16 diff) but
@@ -47,15 +55,58 @@ except ImportError:
     _fla_chunk = _fla_recurrent = None
     _HAS_FLA = False
 
-# Kernel selection (env-overridable A/B switches).  Measured on RTX 5080
-# (bench_qwen35, 64-seq mixed load, cudagraph): the triton recurrent wins
-# inside the decode graph (no launch overhead, less GPU time), but the
-# triton chunk's ~0.56ms/call Python launcher overhead makes eager prefill
-# CPU-bound and 44% slower end-to-end despite 4.7x faster kernels — so the
-# torch chunk stays the default.  FLA_CHUNK=1 / FLA_RECURRENT=0 override.
+# Kernel selection (env-overridable A/B switches).  Measured on RTX 5090
+# (fla 0.5.2 / torch 2.13 / triton 3.7): the triton chunk kernel is 8-30x
+# faster than the torch port at engine-batch shapes (16k tokens: ~1.0ms vs
+# 9-30ms per layer) with ~1e-3 bf16-level numerical agreement, and the
+# triton recurrent is ~1.4x faster at decode bs≈218 — so both default on
+# now that fla is installed.  FLA_CHUNK=0 / FLA_RECURRENT=0 fall back to
+# the pure-torch ports.
 import os as _os
 _USE_FLA_RECURRENT = _HAS_FLA and _os.environ.get("FLA_RECURRENT", "1") == "1"
-_USE_FLA_CHUNK = _HAS_FLA and _os.environ.get("FLA_CHUNK", "0") == "1"
+_USE_FLA_CHUNK = _HAS_FLA and _os.environ.get("FLA_CHUNK", "1") == "1"
+# A/B switch for the in-place decode recurrent (NANOVLLM_GDN_INPLACE=0
+# restores the gather → recurrent → scatter reference path).
+_USE_GDN_INPLACE = _os.environ.get("NANOVLLM_GDN_INPLACE", "1") == "1"
+
+
+# ── Shared dynamic-shape compiled kernels (see class docstrings: instance
+# method compiles exhaust the dynamo recompile cache and fall back to
+# eager; one dynamic kernel serves all 24 layers and every batch shape) ──
+
+@torch.compile(dynamic=True)
+def _gemma_rms_forward(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    x = x.float()
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(var + eps)
+    x = x * (1.0 + weight.float())
+    return x.to(weight.dtype)
+
+
+@torch.compile(dynamic=True)
+def _gemma_add_rms_forward(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    orig_dtype = x.dtype
+    residual = (x.float() + residual.float()).to(orig_dtype)
+    x = residual.float()
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(var + eps)
+    x = x * (1.0 + weight.float())
+    return x.to(orig_dtype), residual
+
+
+@torch.compile(dynamic=True)
+def _rms_gated_forward(
+    hidden_states: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    input_dtype = hidden_states.dtype
+    x = hidden_states.to(torch.float32)
+    var = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(var + eps)
+    x = weight * x.to(input_dtype)
+    x = x * F.silu(gate.to(torch.float32))
+    return x.to(input_dtype)
 
 
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6):
@@ -165,7 +216,70 @@ def recurrent_gated_delta_rule(query, key, value, g, beta, initial_state=None):
                                              initial_state)
 
 
-@torch.compile
+# ── In-place decode recurrent ────────────────────────────────────────
+# The decode step used to gather s_cache[ids] (452MB at bs=218), run the
+# recurrent, then scatter back — ~3.6GB of pure state copying per step
+# (~40% of decode GPU time).  This kernel indexes the pool rows directly
+# and updates them in place: S ← S·exp(g) + k⊗β(v − Sᵀk); out = Sᵀq.
+# Numerically mirrors _torch_recurrent_gated_delta_rule (fp32 math, q/k
+# l2-normalised with eps 1e-6 then q scaled by DK^-0.5).
+
+@triton.jit
+def _recurrent_inplace_kernel(
+    Q, K, V, G, B, S_POOL, IDS, OUT, scale,
+    q_bstride, k_bstride, v_bstride, slot_stride,
+    H: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
+):
+    pid = tl.program_id(0)                       # one program per (seq, head)
+    b = pid // H
+    h = pid % H
+    offs_k = tl.arange(0, DK)
+    offs_v = tl.arange(0, DV)
+    # q/k/v come from split_qkv: views into the [bs, conv_dim, 1] mixed
+    # buffer, so the batch stride is conv_dim (6144), NOT H*D — index via
+    # the passed strides or every b > 0 row reads garbage.
+    q = tl.load(Q + b * q_bstride + h * DK + offs_k).to(tl.float32)
+    k = tl.load(K + b * k_bstride + h * DK + offs_k).to(tl.float32)
+    v = tl.load(V + b * v_bstride + h * DV + offs_v).to(tl.float32)
+    beta = tl.load(B + b * H + h).to(tl.float32)
+    g = tl.load(G + b * H + h)
+    q = q * tl.rsqrt(tl.sum(q * q, 0) + 1e-6)
+    k = k * tl.rsqrt(tl.sum(k * k, 0) + 1e-6)
+    q = q * scale
+    slot = tl.load(IDS + b).to(tl.int64)
+    # s_pool is a per-layer VIEW of the state pool: consecutive slots are
+    # L·H·K·V elements apart (slot_stride), heads are dense within a slot.
+    sp = S_POOL + slot * slot_stride + h * (DK * DV)
+    s = tl.load(sp + offs_k[:, None] * DV + offs_v[None, :])   # [DK, DV] fp32
+    s = s * tl.exp(g)
+    kv = tl.sum(s * k[:, None], 0)                             # [DV]
+    delta = (v - kv) * beta
+    s = s + k[:, None] * delta[None, :]
+    tl.store(sp + offs_k[:, None] * DV + offs_v[None, :], s)
+    out = tl.sum(s * q[:, None], 0)                            # [DV]
+    tl.store(OUT + pid * DV + offs_v, out.to(OUT.dtype.element_ty))
+
+
+def recurrent_gdn_inplace(q, k, v, g, beta, s_pool, ids):
+    """q/k/v [bs, 1, H, D] bf16, g/beta [bs, 1, H]; updates s_pool rows
+    `ids` in place, returns out [bs, 1, H, DV] bf16.  q/k/v may be strided
+    views of the conv output; s_pool a per-layer view of the state pool."""
+    bs, _, H, DK = k.shape
+    DV = v.shape[-1]
+    assert q.stride(2) == DK and k.stride(2) == DK and v.stride(2) == DV
+    assert g.is_contiguous() and beta.is_contiguous()
+    assert s_pool.stride(1) == DK * DV and s_pool.stride(2) == DV \
+        and s_pool.stride(3) == 1
+    out = torch.empty(bs, 1, H, DV, dtype=v.dtype, device=v.device)
+    _recurrent_inplace_kernel[(bs * H,)](
+        q, k, v, g, beta, s_pool, ids, out, DK ** -0.5,
+        q.stride(0), k.stride(0), v.stride(0), s_pool.stride(0),
+        H=H, DK=DK, DV=DV, num_warps=4,
+    )
+    return out
+
+
+@torch.compile(dynamic=True)
 def _torch_recurrent_gated_delta_rule(query, key, value, g, beta,
                                       initial_state=None):
     """Single-step gated delta rule (port of transformers' torch version).
@@ -210,6 +324,12 @@ class Qwen3_5RMSNorm(nn.Module):
     single bf16 rounding at the end; the residual sum is rounded to bf16
     before normming) — the real checkpoint's activation scale amplifies
     any extra intermediate rounding.
+
+    The compiled kernels are module-level free functions with (weight, eps)
+    passed explicitly: instance-method compiles guard on `self`, so the
+    per-layer instances each recompile and exhaust the dynamo cache — every
+    later call runs eager under guard overhead, and CUDA graphs captured
+    after the 8th recompile bake the eager fallback.
     """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
@@ -217,23 +337,11 @@ class Qwen3_5RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(hidden_size))
 
-    @torch.compile
     def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.float()
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        x = x * (1.0 + self.weight.float())
-        return x.to(self.weight.dtype)
+        return _gemma_rms_forward(x, self.weight, self.eps)
 
-    @torch.compile
     def add_rms_forward(self, x: torch.Tensor, residual: torch.Tensor):
-        orig_dtype = x.dtype
-        residual = (x.float() + residual.float()).to(orig_dtype)
-        x = residual.float()
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        x = x * (1.0 + self.weight.float())
-        return x.to(orig_dtype), residual
+        return _gemma_add_rms_forward(x, residual, self.weight, self.eps)
 
     def forward(self, x, residual=None):
         if residual is None:
@@ -252,15 +360,8 @@ class Qwen3_5RMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
 
-    @torch.compile
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor):
-        input_dtype = hidden_states.dtype
-        x = hidden_states.to(torch.float32)
-        var = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        x = self.weight * x.to(input_dtype)
-        x = x * F.silu(gate.to(torch.float32))
-        return x.to(input_dtype)
+        return _rms_gated_forward(hidden_states, gate, self.weight, self.eps)
 
 
 class Qwen3_5Attention(nn.Module):
@@ -274,7 +375,7 @@ class Qwen3_5Attention(nn.Module):
 
     def __init__(self, config) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_size()
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -339,46 +440,79 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def __init__(self, config) -> None:
         super().__init__()
+        tp_size = get_tp_size()
         self.hidden_size = config.hidden_size
-        self.num_k_heads = config.linear_num_key_heads
-        self.num_v_heads = config.linear_num_value_heads
+        self.total_num_k_heads = config.linear_num_key_heads
+        self.total_num_v_heads = config.linear_num_value_heads
+        assert self.total_num_v_heads % self.total_num_k_heads == 0, \
+            "qwen3_5: v/k head replication not supported (2B has 16/16)"
+        assert self.total_num_k_heads % tp_size == 0
+        assert self.total_num_v_heads % tp_size == 0
+        # TP-local head counts / dims: every projection, the conv channels
+        # and the recurrent state all shard at v-head granularity.
+        self.num_k_heads = self.total_num_k_heads // tp_size
+        self.num_v_heads = self.total_num_v_heads // tp_size
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
-        assert self.num_v_heads % self.num_k_heads == 0, \
-            "qwen3_5: v/k head replication not supported (2B has 16/16)"
-        self.key_dim = self.head_k_dim * self.num_k_heads
-        self.value_dim = self.head_v_dim * self.num_v_heads
+        self.key_dim = self.head_k_dim * self.num_k_heads          # TP-local
+        self.value_dim = self.head_v_dim * self.num_v_heads        # TP-local
         self.conv_kernel = config.linear_conv_kernel_dim
-        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv_dim = self.key_dim * 2 + self.value_dim          # TP-local
+        self._total_conv_dim = self.head_k_dim * self.total_num_k_heads * 2 \
+            + self.head_v_dim * self.total_num_v_heads
 
         self.in_proj_qkv = ColumnParallelLinear(
-            self.hidden_size, self.conv_dim, bias=False)
+            self.hidden_size, self._total_conv_dim, bias=False)
+        # The qkv checkpoint layout is [q(key), k(key), v(value)] — a plain
+        # contiguous column shard would cut mid-head at the q/k boundary;
+        # shard each part by heads instead.
+        self.in_proj_qkv.weight.weight_loader = self._conv_layout_loader
         self.in_proj_z = ColumnParallelLinear(
-            self.hidden_size, self.value_dim, bias=False)
+            self.hidden_size, self.head_v_dim * self.total_num_v_heads, bias=False)
         self.in_proj_b = ColumnParallelLinear(
-            self.hidden_size, self.num_v_heads, bias=False)
+            self.hidden_size, self.total_num_v_heads, bias=False)
         self.in_proj_a = ColumnParallelLinear(
-            self.hidden_size, self.num_v_heads, bias=False)
+            self.hidden_size, self.total_num_v_heads, bias=False)
         # padding is applied per-call (0 or kernel-1 depending on state)
         self.conv1d = nn.Conv1d(
             self.conv_dim, self.conv_dim, self.conv_kernel,
             groups=self.conv_dim, padding=0, bias=False)
-        A = torch.empty(self.num_v_heads).uniform_(0, 16)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        self.conv1d.weight.weight_loader = self._conv_layout_loader
+        A = torch.empty(self.total_num_v_heads).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A))     # full; sliced per rank
+        self.dt_bias = nn.Parameter(torch.ones(self.total_num_v_heads))
+        self._v_head_slice = slice(
+            get_tp_rank() * self.num_v_heads, (get_tp_rank() + 1) * self.num_v_heads)
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
-        self.out_proj = RowParallelLinear(self.value_dim, self.hidden_size, bias=False)
+        self.out_proj = RowParallelLinear(
+            self.head_v_dim * self.total_num_v_heads, self.hidden_size, bias=False)
         # State-pool views bound by ModelRunner (index by slot id).
         self.s_cache: torch.Tensor | None = None      # [slots, H, K, V] fp32
         self.conv_cache: torch.Tensor | None = None   # [slots, conv_dim, kernel-1]
+
+    def _conv_layout_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """Shard a [q | k | v] concatenated dim at head granularity.
+
+        Applies to both in_proj_qkv.weight [conv_dim, hidden] and
+        conv1d.weight [conv_dim, 1, kernel]: dim 0 holds the q/k/v parts
+        back to back, each part uniform in head size, so chunking each part
+        separately keeps rank boundaries head-aligned."""
+        kd = self.head_k_dim * self.total_num_k_heads
+        vd = self.head_v_dim * self.total_num_v_heads
+        q, k, v = loaded_weight.split([kd, kd, vd], dim=0)
+        r, s = get_tp_rank(), get_tp_size()
+        param.data.copy_(torch.cat([t.chunk(s, dim=0)[r] for t in (q, k, v)], dim=0))
 
     # Chunk-kernel call budget (padded tokens per call): the pure-torch
     # kernel's fp32 intermediates need ~150MB per 1k padded tokens, so one
     # call over a full 16k-token engine batch demands multi-GB transient
     # peaks — with a large KV pool that leaves no headroom and the
-    # allocator livelocks in OOM-retry.  Segments thread the recurrent/
-    # conv state, so splitting is exactly equivalent to one call.
-    PREFILL_SEGMENT_TOKENS = 4096
+    # allocator livelocks in OOM-retry.  The fla triton chunk kernel has no
+    # such blow-up, so it segments at the full engine batch instead (fewer
+    # Python launcher calls).  Segments thread the recurrent/conv state,
+    # so splitting is exactly equivalent to one call.
+    PREFILL_SEGMENT_TOKENS_FLA = 16384
+    PREFILL_SEGMENT_TOKENS_TORCH = 4096
 
     def forward(
         self,
@@ -406,7 +540,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         b = self.in_proj_b(x)                             # [bs, T, H]
         a = self.in_proj_a(x)                             # [bs, T, H]
         beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+        A_log = self.A_log[self._v_head_slice]
+        dt_bias = self.dt_bias[self._v_head_slice]
+        g = -A_log.float().exp() * F.softplus(a.float() + dt_bias.float())
+        if mask is not None:
+            # Padded rows: k/v are zero there (bias-free conv over zero
+            # input) but g is NOT (-exp(A_log)·softplus(dt_bias) < 0) —
+            # left unmasked it decays the recurrent state across the
+            # padding tail, wiping short sequences' state in a
+            # mixed-length batch.  g=0 makes trailing chunks exact no-ops
+            # (beta is irrelevant: the state update is proportional to k).
+            g = g.masked_fill(~mask.unsqueeze(-1), 0.0)
         conv_w = self.conv1d.weight                       # [conv_dim, 1, k]
 
         def split_qkv(mixed, n):
@@ -428,15 +572,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             mixed = F.silu(F.conv1d(window, conv_w, groups=self.conv_dim))
             q, k, v = split_qkv(mixed, 1)
             z = self.in_proj_z(x)
-            out, new_s = recurrent_gated_delta_rule(q, k, v, g, beta, self.s_cache[ids])
-            self.s_cache[ids] = new_s
+            if _USE_GDN_INPLACE:
+                # In-place pool update (no gather/scatter of the 452MB state).
+                out = recurrent_gdn_inplace(q, k, v, g, beta, self.s_cache, ids)
+            else:
+                out, new_s = recurrent_gated_delta_rule(
+                    q, k, v, g, beta, self.s_cache[ids])
+                self.s_cache[ids] = new_s
         else:
             # Prefill / chunk continuation, in T-segments (see
             # PREFILL_SEGMENT_TOKENS).  The conv state threads across
             # segments; a zero state on the first segment of a fresh prefill
             # is identical to the causal conv's zero left-padding.
             z = self.in_proj_z(x)                         # [bs, T, value_dim]
-            seg = max(1, self.PREFILL_SEGMENT_TOKENS // bs)
+            seg_tokens = (self.PREFILL_SEGMENT_TOKENS_FLA if _USE_FLA_CHUNK
+                          else self.PREFILL_SEGMENT_TOKENS_TORCH)
+            seg = max(1, seg_tokens // bs)
             conv_states = self.conv_cache[ids]            # [bs, conv_dim, k-1]
             state = self.s_cache[ids]
             outs = []
@@ -446,15 +597,29 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 mixed = self.in_proj_qkv(x[:, t0:t1]).transpose(1, 2)
                 window = torch.cat([conv_states, mixed], dim=-1)
                 mixed = F.silu(F.conv1d(window, conv_w, groups=self.conv_dim))
+                seg_mask = mask[:, t0:t1] if mask is not None else None
+                if seg_mask is not None:
+                    # Padded rows' conv output would see the real history
+                    # through the sliding window (non-zero k/v) and pollute
+                    # the recurrent state — zero them so padding is an
+                    # exact no-op.
+                    mixed = mixed * seg_mask.unsqueeze(1).to(mixed.dtype)
                 # Per-seq conv-state writeback at the latest real position:
-                # window layout is [state(k-1), x(n)].
-                for b_i in range(bs):
-                    r = int(lens[b_i]) - t0
-                    if r >= n:
-                        self.conv_cache[ids[b_i]] = window[b_i, :, -3:]
-                    elif r > 0:
-                        self.conv_cache[ids[b_i]] = window[b_i, :, r:r + 3]
-                    # r <= 0: padding-only rows for this seq — keep its state
+                # window layout is [state(k-1), x(n)], token t0+i sits at
+                # column k-1+i, so the 3-wide state after a seq's last real
+                # token in this segment starts at column min(r, n) (r =
+                # remaining real tokens).  Batched gather replaces the old
+                # per-seq loop (one GPU sync per row via int(lens[b_i])).
+                if seg_mask is not None:
+                    r = (lens - t0)
+                    starts = r.clamp(min=0, max=n)        # [bs]
+                    valid = r > 0                          # padding-only seqs keep their state
+                    cols = starts.view(bs, 1, 1) + torch.arange(
+                        3, device=window.device, dtype=torch.int64)
+                    sel = window.gather(-1, cols.expand(bs, window.size(1), 3))
+                    self.conv_cache[ids[valid]] = sel[valid]
+                else:
+                    self.conv_cache[ids] = window[..., -3:]
                 conv_states = window[..., -3:]
                 q, k, v = split_qkv(mixed, n)
                 out_i, state = chunk_gated_delta_rule(
@@ -530,10 +695,26 @@ class Qwen3_5Model(nn.Module):
 
     def __init__(self, config) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(
-            [Qwen3_5DecoderLayer(config, i) for i in range(config.num_hidden_layers)])
+        self.pp_first = get_pp_rank() == 0
+        self.pp_last = get_pp_rank() == get_pp_size() - 1
+        self.start_layer, self.end_layer = split_layers(
+            config.num_hidden_layers, get_pp_size(), get_pp_rank())
+        if self.pp_first:
+            self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        else:
+            self.embed_tokens = None
+        self.layers = nn.ModuleList([
+            Qwen3_5DecoderLayer(config, i)
+            if self.start_layer <= i < self.end_layer else PipelineLayerShell()
+            for i in range(config.num_hidden_layers)])
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def checkpoint_skips(self, weight_name: str) -> bool:
+        """True for checkpoint weights this pipeline stage does not own."""
+        if self.embed_tokens is None and ".embed_tokens." in weight_name:
+            return True
+        m = re.search(r"\.layers\.(\d+)\.", weight_name)
+        return bool(m) and not (self.start_layer <= int(m.group(1)) < self.end_layer)
 
     def forward(
         self,
@@ -541,14 +722,22 @@ class Qwen3_5Model(nn.Module):
         positions: torch.Tensor,
         skip_layers: tuple[int, ...] | None = None,
         output_layer_hidden: list[int] | None = None,
+        hidden_states: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
     ):
         # skip_layers / output_layer_hidden exist for signature parity with
         # Qwen3ForCausalLM (speculative-decoding hooks); the qwen3_5 config
         # asserts speculative decoding off, so they are ignored here.
-        hidden_states = self.embed_tokens(input_ids)
-        residual = None
+        if hidden_states is None:
+            hidden_states = self.embed_tokens(input_ids)
+            residual = None
         for layer in self.layers:
+            if isinstance(layer, PipelineLayerShell):
+                continue
             hidden_states, residual = layer(positions, hidden_states, residual)
+        if not self.pp_last:
+            # Intermediate pipeline stage: hand the fused-residual chain on.
+            return hidden_states, residual
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -567,9 +756,25 @@ class Qwen3_5ForCausalLM(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         self.model = Qwen3_5Model(config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if config.tie_word_embeddings:
-            self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        self.pp_first, self.pp_last = self.model.pp_first, self.model.pp_last
+        if self.pp_last:
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+            if config.tie_word_embeddings and self.pp_first:
+                self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        else:
+            self.lm_head = None
+        # Tied embeddings across pipeline stages: the last stage has no
+        # embed_tokens to share storage with, so route the embed checkpoint
+        # entry into lm_head directly (its vocab-sharded loader applies).
+        self.checkpoint_aliases = (
+            {"model.embed_tokens.weight": "lm_head.weight"}
+            if config.tie_word_embeddings and self.lm_head is not None and not self.pp_first
+            else {})
+
+    def checkpoint_skips(self, weight_name: str) -> bool:
+        if self.model.checkpoint_skips(weight_name):
+            return True
+        return self.lm_head is None and weight_name.startswith("lm_head.")
 
     def forward(
         self,
@@ -577,10 +782,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         positions: torch.Tensor,
         skip_layers: tuple[int, ...] | None = None,
         output_layer_hidden: list[int] | None = None,
+        hidden_states: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
     ):
-        return self.model(input_ids, positions)
+        return self.model(input_ids, positions, hidden_states=hidden_states,
+                          residual=residual)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert self.lm_head is not None, "compute_logits on a non-last pipeline stage"
         return self.lm_head(hidden_states)
 
     def compute_all_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

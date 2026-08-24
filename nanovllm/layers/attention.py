@@ -3,8 +3,17 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+
+try:
+    from flash_attn import flash_attn_varlen_func
+except ImportError:
+    # No flash-attn wheel exists for this torch/CUDA combo (cu13 + sm120).
+    # vLLM vendors the same FA2 varlen kernel with an identical API —
+    # numerically verified against a matmul reference on this GPU.
+    # Two differences: it exports no flash_attn_with_kvcache (unused here),
+    # and with a block_table it requires seqused_k instead of cu_seqlens_k.
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 
 @triton.jit
@@ -100,12 +109,19 @@ class Attention(nn.Module):
                 context.flashinfer_prefill.run(q[nd:], (k_cache, v_cache)),
             ))
 
+        # Paged path (block_tables): the per-seq KV length is seqused_k =
+        # diff(cu_seqlens_k); the vllm FA2 fork takes it INSTEAD of
+        # cu_seqlens_k when a block_table is given. The ragged path (raw
+        # k/v, no block table) keeps cu_seqlens_k.
         o = flash_attn_varlen_func(
             q, k, v,
             max_seqlen_q=context.max_seqlen_q,
             cu_seqlens_q=context.cu_seqlens_q,
             max_seqlen_k=context.max_seqlen_k,
-            cu_seqlens_k=context.cu_seqlens_k,
+            cu_seqlens_k=(None if block_tables is not None
+                          else context.cu_seqlens_k),
+            seqused_k=(torch.diff(context.cu_seqlens_k)
+                       if block_tables is not None else None),
             softmax_scale=self.scale,
             causal=True,
             block_table=block_tables,

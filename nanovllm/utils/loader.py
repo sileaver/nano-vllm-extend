@@ -15,6 +15,11 @@ def load_model(model: nn.Module, path: str):
     # shell: "model.language_model.*" -> "model.*", visual/mtp skipped).
     remapping = getattr(model, "weight_remapping", ())
     ignored = getattr(model, "ignored_weight_prefixes", ())
+    # Pipeline parallelism: stages skip weights of layers they do not own
+    # and may re-route entries (tied embeddings -> lm_head on the last
+    # stage, which has no embed_tokens to share storage with).
+    skip_fn = getattr(model, "checkpoint_skips", None)
+    aliases = getattr(model, "checkpoint_aliases", {})
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             for ckpt_name in f.keys():
@@ -25,6 +30,9 @@ def load_model(model: nn.Module, path: str):
                     if weight_name.startswith(old):
                         weight_name = new + weight_name[len(old):]
                         break
+                weight_name = aliases.get(weight_name, weight_name)
+                if skip_fn is not None and skip_fn(weight_name):
+                    continue
                 for k in packed_modules_mapping:
                     if k in weight_name:
                         v, shard_id = packed_modules_mapping[k]

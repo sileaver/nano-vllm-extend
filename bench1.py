@@ -8,16 +8,18 @@ from nanovllm import LLM, SamplingParams
 def main():
     seed(0)
     num_seqs = 256
+    # num_seqs = 512
     max_input_len = 1024
     max_output_len = 1024
 
-    # path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    path = os.path.expanduser("~/huggingface/Qwen3.5-2B/")
+    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    # path = os.path.expanduser("~/huggingface/Qwen3.5-2B/")
     llm = LLM(
         model=path,
         enforce_eager=False,
         max_model_len=4096,
-        collect_timing=True
+        # collect_timing=True,
+        data_parallel_size=2
         # sampling_backend="flashinfer"
         # attention_backend="flashinfer"
     )
@@ -43,7 +45,10 @@ def main():
     torch.cuda.synchronize()
     t0 = time.time()
 
-    outputs, stats = llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+    res = llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+    # collect_timing=True returns (outputs, stats); DP and plain runs
+    # return just outputs.
+    outputs, stats = res if isinstance(res, tuple) else (res, None)
 
     torch.cuda.synchronize()
     elapsed = time.time() - t0
@@ -63,13 +68,13 @@ def main():
     print(f"Total Throughput:  {total_throughput:.2f} tok/s")
 
     # ── Latency ───────────────────────────────────────────────
-    print(f"\nLatency (n={stats['num_requests']} requests):")
-    print(f"  TTFT mean:   {stats['ttft_mean']*1000:.1f} ms")
-    print(f"  TTFT p50:    {stats['ttft_p50']*1000:.1f} ms")
-    print(f"  TTFT p99:    {stats['ttft_p99']*1000:.1f} ms")
-    print(f"  TPOT mean:   {stats['tpot_mean']*1000:.1f} ms")
-    print(f"  TPOT p50:    {stats['tpot_p50']*1000:.1f} ms")
-    print(f"  TPOT p99:    {stats['tpot_p99']*1000:.1f} ms")
+    # print(f"\nLatency (n={stats['num_requests']} requests):")
+    # print(f"  TTFT mean:   {stats['ttft_mean']*1000:.1f} ms")
+    # print(f"  TTFT p50:    {stats['ttft_p50']*1000:.1f} ms")
+    # print(f"  TTFT p99:    {stats['ttft_p99']*1000:.1f} ms")
+    # print(f"  TPOT mean:   {stats['tpot_mean']*1000:.1f} ms")
+    # print(f"  TPOT p50:    {stats['tpot_p50']*1000:.1f} ms")
+    # print(f"  TPOT p99:    {stats['tpot_p99']*1000:.1f} ms")
 
 
 if __name__ == "__main__":

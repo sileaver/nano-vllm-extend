@@ -11,6 +11,11 @@ class Config:
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+    data_parallel_size: int = 1
+    # TCP-store port offset per DP replica (each replica needs its own
+    # rendezvous); assigned by the engine, 0 for standalone groups.
+    dist_port: int = 2333
     enforce_eager: bool = False
     async_scheduling: bool = False
     continuous_batching: bool = False
@@ -38,6 +43,10 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        assert 1 <= self.pipeline_parallel_size <= 8
+        assert 1 <= self.data_parallel_size <= 8
+        assert self.data_parallel_size * self.pipeline_parallel_size \
+            * self.tensor_parallel_size <= 8, "at most 8 GPUs supported"
         assert self.attention_backend in ("flash_attn", "flashinfer")
         assert self.sampling_backend in ("torch", "flashinfer")
         hf_config = AutoConfig.from_pretrained(self.model)
@@ -48,12 +57,17 @@ class Config:
             hf_config = hf_config.text_config
         self.hf_config = hf_config
         if "qwen3_5" in hf_config.model_type:
-            # Hybrid architecture v1: plain paged-KV + torch recurrent
-            # kernels.  Spec decode (state rollback), gpu_prepare, TP and
-            # the flashinfer wrappers are not wired for it yet.
+            # Hybrid architecture: TP shards the GDN heads (num_v_heads must
+            # divide evenly).  Spec decode (state rollback), gpu_prepare and
+            # the flashinfer wrappers remain unsupported.
             assert self.num_spec_tokens == 0, "qwen3_5: speculative decoding unsupported"
             assert not self.gpu_prepare, "qwen3_5: gpu_prepare unsupported"
-            assert self.tensor_parallel_size == 1, "qwen3_5: tensor_parallel_size must be 1"
+            assert hf_config.linear_num_value_heads % self.tensor_parallel_size == 0, \
+                "qwen3_5: linear_num_value_heads not divisible by tensor_parallel_size"
+            assert hf_config.linear_num_key_heads % self.tensor_parallel_size == 0, \
+                "qwen3_5: linear_num_key_heads not divisible by tensor_parallel_size"
+            assert hf_config.num_key_value_heads % self.tensor_parallel_size == 0, \
+                "qwen3_5: num_key_value_heads not divisible by tensor_parallel_size"
             assert self.attention_backend == "flash_attn", "qwen3_5: use the flash_attn backend"
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if self.num_spec_tokens > 0:

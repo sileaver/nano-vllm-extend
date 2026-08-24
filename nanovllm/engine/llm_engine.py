@@ -3,6 +3,7 @@ from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -13,28 +14,85 @@ from nanovllm.engine.async_scheduler import AsyncScheduler
 from nanovllm.engine.model_runner import ModelRunner
 
 
+def dp_engine_worker(config: Config, dp_idx: int, req_queue, result_queue):
+    """One DP replica: a full engine (own scheduler + tp*pp runners) fed
+    from its request shard.  Lives for the LLM's lifetime, rounds demarcated
+    by "round" markers; results stream back tagged with the driver's
+    request ids."""
+    config.data_parallel_size = 1
+    config.dist_port = 2333 + dp_idx
+    engine = LLMEngine(config=config, dp_idx=dp_idx)
+    seq_to_req: dict[int, int] = {}
+    try:
+        while True:
+            msg = req_queue.get()
+            kind = msg[0]
+            if kind == "exit":
+                return
+            elif kind == "req":
+                _, req_id, prompt, sp = msg
+                seq = engine.add_request(prompt, sp)
+                seq_to_req[seq.seq_id] = req_id
+            elif kind == "round":
+                while not engine.is_finished():
+                    finished, _ = engine.step()
+                    for seq_id, tokens in finished:
+                        result_queue.put(("finished", seq_to_req.pop(seq_id), tokens))
+                result_queue.put(("round_done", dp_idx))
+    finally:
+        engine.exit()
+
+
 class LLMEngine:
 
-    def __init__(self, model, **kwargs):
-        config_fields = {field.name for field in fields(Config)}
-        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        config = Config(model, **config_kwargs)
+    def __init__(self, model=None, *, config: Config | None = None,
+                 dp_idx: int = 0, **kwargs):
+        if config is None:
+            config_fields = {field.name for field in fields(Config)}
+            config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+            config = Config(model, **config_kwargs)
+        self.config = config
+        self.dp_idx = dp_idx
         Sequence.block_size = config.kvcache_block_size
         self.async_scheduling = config.async_scheduling
         self.continuous_batching = config.continuous_batching
         self.collect_timing = kwargs.get("collect_timing", False)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        config.eos = self.tokenizer.eos_token_id
+        # Timing collection (single-group only: DP replicas collect their
+        # own stats internally; the list stays empty on the driver).
+        self._finished_seqs: list[Sequence] = []
+        atexit.register(self.exit)
+        if config.data_parallel_size > 1:
+            self._init_data_parallel(config)
+        else:
+            self._init_single_group(config)
+
+    # ------------------------------------------------------------------
+    # Process layout
+    # ------------------------------------------------------------------
+
+    def _init_single_group(self, config: Config):
+        """One replica group: tp*pp - 1 worker processes plus this process
+        as group rank 0."""
+        world = config.tensor_parallel_size * config.pipeline_parallel_size
+        assert torch.cuda.device_count() >= world, f"{world} ranks need {world} GPUs"
         self.ps = []
         self.events = []
+        self.acks = []
         ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
+        for i in range(1, world):
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            ack = ctx.Event()
+            ack.set()  # phantom ack: no command has been written yet
+            process = ctx.Process(target=ModelRunner,
+                                  args=(config, i, event, self.dp_idx, ack))
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
+            self.acks.append(ack)
+        self.model_runner = ModelRunner(config, 0, self.events, self.dp_idx,
+                                        self.acks)
         if config.num_spec_tokens > 0:
             assert not config.async_scheduling, \
                 "spec v1: async_scheduling unsupported with speculative decoding"
@@ -42,15 +100,42 @@ class LLMEngine:
             self.scheduler = AsyncScheduler(config)
         else:
             self.scheduler = Scheduler(config)
-        atexit.register(self.exit)
 
         # Async scheduling state.
         self._pending_seqs: list[Sequence] | None = None
-        # Timing collection.
-        self._finished_seqs: list[Sequence] = []
+
+    def _init_data_parallel(self, config: Config):
+        """Data parallelism: dp replica processes, each a full engine on its
+        own GPU group with its own scheduler.  The driver only shards
+        requests (LPT) and merges results."""
+        dp = config.data_parallel_size
+        gpus_needed = dp * config.pipeline_parallel_size * config.tensor_parallel_size
+        assert torch.cuda.device_count() >= gpus_needed, \
+            f"data_parallel={dp} needs {gpus_needed} GPUs"
+        assert not self.collect_timing, "collect_timing unsupported with data parallelism"
+        self.dp_req_queues = [mp.get_context("spawn").Queue() for _ in range(dp)]
+        self.dp_result_queue = mp.get_context("spawn").Queue()
+        self.dp_ps = []
+        ctx = mp.get_context("spawn")
+        for d in range(dp):
+            process = ctx.Process(
+                target=dp_engine_worker,
+                args=(config, d, self.dp_req_queues[d], self.dp_result_queue))
+            process.start()
+            self.dp_ps.append(process)
 
     def exit(self):
         # Idempotent: atexit fires again after a manual exit().
+        if getattr(self, "config", None) is not None and \
+                self.config.data_parallel_size > 1:
+            if not hasattr(self, "dp_ps"):
+                return
+            for q in self.dp_req_queues:
+                q.put(("exit",))
+            for p in self.dp_ps:
+                p.join()
+            del self.dp_ps
+            return
         if not hasattr(self, "model_runner"):
             return
         self.model_runner.call("exit")
@@ -59,6 +144,8 @@ class LLMEngine:
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        assert self.config.data_parallel_size == 1, \
+            "data parallelism supports generate() only (requests are sharded by the driver)"
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
@@ -68,6 +155,7 @@ class LLMEngine:
             seq.arrival_time = time.time()
             self._finished_seqs.append(seq)
         self.scheduler.add(seq)
+        return seq
 
     def reset_timing(self):
         """Clear accumulated timing data (call after warmup)."""
@@ -154,15 +242,75 @@ class LLMEngine:
     # ------------------------------------------------------------------
 
     def step(self):
+        if self.config.data_parallel_size > 1:
+            raise NotImplementedError(
+                "data parallelism supports generate() only — stepping happens inside the replica workers")
         if self.async_scheduling:
             return self._step_async()
         else:
             return self._step_sync()
 
     def is_finished(self):
+        if self.config.data_parallel_size > 1:
+            raise NotImplementedError(
+                "data parallelism supports generate() only — state lives inside the replica workers")
         return self.scheduler.is_finished()
 
     def generate(
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        use_tqdm: bool = True,
+    ) -> list[str]:
+        if self.config.data_parallel_size > 1:
+            return self._generate_dp(prompts, sampling_params, use_tqdm)
+        return self._generate_single(prompts, sampling_params, use_tqdm)
+
+    # ------------------------------------------------------------------
+    # Data-parallel generate: LPT-shard across replicas, merge in order
+    # ------------------------------------------------------------------
+
+    def _generate_dp(self, prompts, sampling_params, use_tqdm):
+        dp = self.config.data_parallel_size
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+        # Longest-processing-time bin packing on prompt+output tokens: for
+        # ragged request mixes this balances replica completion times far
+        # better than round-robin.
+        costs = []
+        for prompt, sp in zip(prompts, sampling_params):
+            n = len(self.tokenizer.encode(prompt)) if isinstance(prompt, str) else len(prompt)
+            costs.append(n + sp.max_tokens)
+        order = sorted(range(len(prompts)), key=lambda i: -costs[i])
+        loads = [0] * dp
+        for i in order:
+            d = loads.index(min(loads))
+            loads[d] += costs[i]
+            self.dp_req_queues[d].put(("req", i, prompts[i], sampling_params[i]))
+        for q in self.dp_req_queues:
+            q.put(("round",))
+
+        pbar = tqdm(total=len(prompts), desc="Generating (DP)",
+                    dynamic_ncols=True, disable=not use_tqdm)
+        outputs: dict[int, list[int]] = {}
+        rounds_done = 0
+        while rounds_done < dp:
+            msg = self.dp_result_queue.get()
+            if msg[0] == "finished":
+                _, req_id, token_ids = msg
+                outputs[req_id] = token_ids
+                pbar.update(1)
+            else:
+                rounds_done += 1
+        pbar.close()
+        return [{"text": self.tokenizer.decode(outputs[i]),
+                 "token_ids": outputs[i]} for i in range(len(prompts))]
+
+    # ------------------------------------------------------------------
+    # Single-group generate
+    # ------------------------------------------------------------------
+
+    def _generate_single(
         self,
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],

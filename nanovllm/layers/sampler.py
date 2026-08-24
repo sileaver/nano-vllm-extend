@@ -14,16 +14,21 @@ class Sampler(nn.Module):
             import flashinfer.sampling
             self._fi = flashinfer.sampling
 
-    @torch.compile
+    # dynamic=True: batch size changes every decode step as sequences
+    # finish; static compiles exhaust the dynamo cache and fall to eager.
+    @torch.compile(dynamic=True)
     def _forward_torch(self, logits: torch.Tensor, temperatures: torch.Tensor):
-        # Gumbel-max 温度采样 (与类别采样等价). 注意 top_k/top_p 仅
+        # Gumbel-max 温度采样 (与类别采样等价): argmax(softmax(l/T)/e) ≡
+        # argmax(l/T − log e) (softmax 归一化常数在 argmax 中消去), 所以
+        # 无需物化 [bs, vocab] 的 softmax 概率. 注意 top_k/top_p 仅
         # flashinfer 后端支持, 此处忽略.
         logits = logits.float().div_(temperatures.unsqueeze(dim=1))
-        probs = torch.softmax(logits, dim=-1)
-        sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
+        sample_tokens = logits.sub_(
+            torch.empty_like(logits).exponential_(1).clamp_min_(1e-10).log_()
+        ).argmax(dim=-1)
         return sample_tokens
 
-    @torch.compile
+    @torch.compile(dynamic=True)
     def _sample_with_probs_torch(self, logits: torch.Tensor, temperatures: torch.Tensor):
         # 同 Gumbel-max 温度采样, 但非 in-place 且额外返回 softmax 分布 —
         # 投机解码的拒绝采样验证需要草稿模型生成 d_i 所用的精确分布 p_i.

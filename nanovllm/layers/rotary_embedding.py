@@ -36,25 +36,43 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
     def forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        q_rot, k_rot = query[..., :self.rotary_dim], key[..., :self.rotary_dim]
-        q_rot = apply_rotary_emb(q_rot, cos, sin)
-        k_rot = apply_rotary_emb(k_rot, cos, sin)
-        if self.rotary_dim < self.head_size:
-            # Partial RoPE: the tail channels pass through unrotated.
-            query = torch.cat((q_rot, query[..., self.rotary_dim:]), dim=-1)
-            key = torch.cat((k_rot, key[..., self.rotary_dim:]), dim=-1)
-        else:
-            query, key = q_rot, k_rot
-        return query, key
+        return _rope_forward(
+            self.cos_sin_cache, self.rotary_dim, self.head_size,
+            positions, query, key,
+        )
+
+
+# Compiled free function with the cache/dims passed explicitly (see
+# activation.py: instance-method compiles recompile per instance and per
+# shape, exhausting the dynamo cache — every later CUDA graph bakes the
+# eager fallback).
+@torch.compile(dynamic=True)
+def _rope_forward(
+    cos_sin_cache: torch.Tensor,
+    rotary_dim: int,
+    head_size: int,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos_sin = cos_sin_cache[positions]
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    q_rot, k_rot = query[..., :rotary_dim], key[..., :rotary_dim]
+    q_rot = apply_rotary_emb(q_rot, cos, sin)
+    k_rot = apply_rotary_emb(k_rot, cos, sin)
+    if rotary_dim < head_size:
+        # Partial RoPE: the tail channels pass through unrotated.
+        query = torch.cat((q_rot, query[..., rotary_dim:]), dim=-1)
+        key = torch.cat((k_rot, key[..., rotary_dim:]), dim=-1)
+    else:
+        query, key = q_rot, k_rot
+    return query, key
 
 
 @lru_cache(1)

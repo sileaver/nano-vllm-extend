@@ -92,14 +92,31 @@ class Sequence:
                 self.first_token_time = now
 
     def __getstate__(self):
+        # Prefill seqs ship their full token list (workers re-run the
+        # scheduled chunk from it); decode seqs only need the last token.
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_output_placeholders, self.block_table, self.draft_block_table, last_state)
+        return (self.seq_id, self.status, self.is_prefill,
+                self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
+                self.num_scheduled_tokens, self.num_output_placeholders,
+                self.block_table, self.draft_block_table, self.linear_state_id,
+                self.temperature, self.top_k, self.top_p,
+                self.max_tokens, self.ignore_eos, last_state)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_output_placeholders, self.block_table, self.draft_block_table, last_state = state
+        (self.seq_id, self.status, self.is_prefill,
+         self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
+         self.num_scheduled_tokens, self.num_output_placeholders,
+         self.block_table, self.draft_block_table, self.linear_state_id,
+         self.temperature, self.top_k, self.top_p,
+         self.max_tokens, self.ignore_eos, last_state) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
         else:
             self.token_ids = []
             self.last_token = last_state
+        # Attributes the engine touches but the wire format omits.
+        self.timing = False
+        self.arrival_time = 0.0
+        self.first_token_time = None
+        self.token_times = []

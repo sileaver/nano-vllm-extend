@@ -15,22 +15,42 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.flashinfer_env import setup_flashinfer_env
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.parallel import (
+    init_parallel_state, is_first_pp_stage, is_last_pp_stage)
 
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event],
+                 dp_idx: int = 0, ack: Event | list[Event] | None = None):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.use_gpu_prepare = config.gpu_prepare
-        self.world_size = config.tensor_parallel_size
-        self.rank = rank
+        self.tp_size = config.tensor_parallel_size
+        self.pp_size = config.pipeline_parallel_size
+        self.world_size = self.tp_size * self.pp_size
+        self.rank = rank                       # rank within the replica group
+        self.tp_rank = rank % self.tp_size
+        self.pp_rank = rank // self.tp_size
+        self.is_last_stage = self.pp_rank == self.pp_size - 1
+        # Rank that samples tokens: last pipeline stage, tp rank 0 (with
+        # pp == 1 this is rank 0, the driver-side runner).
+        self.sampler_rank = (self.pp_size - 1) * self.tp_size
+        # P2P peers on adjacent stages (same tp rank: activations crossing a
+        # stage boundary are post-all-reduce, i.e. replicated over TP).
+        self.pp_peer_prev = (self.pp_rank - 1) * self.tp_size + self.tp_rank
+        self.pp_peer_next = (self.pp_rank + 1) * self.tp_size + self.tp_rank
         self.event = event
+        # Per-worker ack events (shm buffer-consumed handshakes); rank 0
+        # holds the list, each worker its own.
+        self.ack = ack
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        dist.init_process_group("nccl", f"tcp://127.0.0.1:{config.dist_port}",
+                                world_size=self.world_size, rank=rank)
+        torch.cuda.set_device(dp_idx * self.world_size + rank)
+        init_parallel_state(rank, self.world_size, self.tp_size, self.pp_size, dp_idx)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
@@ -98,6 +118,7 @@ class ModelRunner:
         self.num_spec_tokens = config.num_spec_tokens
         if self.num_spec_tokens > 0:
             assert config.tensor_parallel_size == 1, "spec v1: tensor_parallel_size must be 1"
+            assert config.pipeline_parallel_size == 1, "spec v1: pipeline_parallel_size must be 1"
             assert config.sampling_backend == "torch", "spec v1: sampling_backend must be 'torch'"
             assert not config.gpu_prepare, "spec v1: gpu_prepare unsupported"
         self.warmup_model()
@@ -118,12 +139,19 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
+            # One shm segment per replica group (keyed by the group's
+            # rendezvous port, unique per DP replica).
+            shm_name = f"nanovllm-{config.dist_port}"
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                try:
+                    self.shm = SharedMemory(name=shm_name, create=True, size=2**20)
+                except FileExistsError:
+                    SharedMemory(name=shm_name).unlink()  # stale crashed run
+                    self.shm = SharedMemory(name=shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name=shm_name)
                 self.loop()
 
     def exit(self):
@@ -149,11 +177,23 @@ class ModelRunner:
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
+        # Copy-out done — release the buffer and ack, THEN execute (rank 0
+        # only writes the next command after every worker acked).
         self.event.clear()
+        self.ack.set()
         return method_name, args
 
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
+        # Back-pressure: wait until every worker consumed the previous
+        # command.  Without this, a fast CPU-only command (e.g.
+        # free_finished_gpu_rows) can overwrite the shm buffer while a
+        # worker still hasn't read the previous "run" — the worker then
+        # executes the wrong command and rank 0 deadlocks in the next
+        # all_reduce.
+        for ack in self.ack:
+            ack.wait()
+            ack.clear()
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
@@ -167,6 +207,16 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    def _min_over_group(self, value: int) -> int:
+        """Minimum of *value* across the replica group (PP stages / TP ranks
+        compute different free-memory budgets; the scheduler is driven by
+        rank 0's config, so block/slot counts must agree everywhere)."""
+        if self.world_size == 1:
+            return value
+        t = torch.tensor([value], dtype=torch.int64, device="cuda")
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        return int(t.item())
+
     def _allocate_linear_state_pool(self):
         """GPU pools for the gated-delta-net recurrent/conv states.
 
@@ -174,7 +224,9 @@ class ModelRunner:
         conv_dim, k-1]; per-layer views are bound to the GatedDeltaNet
         modules (same pattern as the paged-KV k/v_cache binding).  Slots
         cost ~19.5 MB each on Qwen3.5-2B, so max_num_seqs is clamped to a
-        ~4 GB budget.
+        ~4 GB budget.  L / H are this rank's local counts (PP stage / TP
+        shard), and the slot count is min-synced so every rank — and the
+        scheduler on rank 0 — agrees.
         """
         gdns = [m for m in self.model.modules() if hasattr(m, "s_cache")]
         L = len(gdns)
@@ -184,7 +236,8 @@ class ModelRunner:
         per_slot = L * (H * K * V * 4 + conv_dim * conv_states * 2)
         free, total = torch.cuda.mem_get_info()
         budget = min(4 * 1024**3, int(total * 0.25))
-        num_slots = min(self.config.max_num_seqs, max(8, budget // per_slot))
+        num_slots = self._min_over_group(
+            min(self.config.max_num_seqs, max(8, budget // per_slot)))
         self.config.max_num_seqs = min(self.config.max_num_seqs, num_slots)
         self.config.num_linear_state_slots = num_slots
         self.linear_s_pool = torch.zeros(num_slots, L, H, K, V,
@@ -261,12 +314,14 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads = hf_config.num_key_value_heads // self.tp_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        # Hybrid models: only the full-attention layers hold paged KV.
-        layer_types = getattr(hf_config, "layer_types", None)
-        num_kv_layers = (sum(1 for t in layer_types if t != "linear_attention")
-                         if layer_types else hf_config.num_hidden_layers)
+        # Attention modules actually present on this rank — PP stages own a
+        # layer subset, TP shards keep every layer, and hybrid models only
+        # build paged-KV attention on the full-attention layers.
+        attn_modules = [m for m in self.model.modules()
+                        if hasattr(m, "k_cache") and hasattr(m, "v_cache")]
+        num_kv_layers = len(attn_modules)
         block_bytes = 2 * num_kv_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         if self.draft_model is not None and not self.use_dflash_draft:
             # Split the remaining budget between target and draft KV by
@@ -291,14 +346,14 @@ class ModelRunner:
             config.num_kvcache_blocks = int(
                 total * config.gpu_memory_utilization - used - peak + current
                 - headroom) // block_bytes
+        # Stages compute different budgets (fewer layers -> more free
+        # memory); the block manager lives on rank 0, so unify on the min.
+        config.num_kvcache_blocks = self._min_over_group(config.num_kvcache_blocks)
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, num_kv_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        for layer_id, module in enumerate(attn_modules):
+            module.k_cache = self.kv_cache[0, layer_id]
+            module.v_cache = self.kv_cache[1, layer_id]
         if self.draft_model is not None and not self.use_dflash_draft:
             self.draft_kv_cache = torch.empty(
                 2, dcfg.num_hidden_layers, config.num_draft_kvcache_blocks,
@@ -375,8 +430,9 @@ class ModelRunner:
         indices = torch.tensor(kv_indices, dtype=torch.int32, device="cuda")
         last_page_len = torch.tensor(last_page_len, dtype=torch.int32, device="cuda")
 
-        # TP-local head counts from the first attention layer.
-        attn = self.model.model.layers[0].self_attn.attn
+        # TP-local head counts from the first attention module on this
+        # stage (PP stages own a layer subset; layer 0 may be a shell).
+        attn = next(m for m in self.model.modules() if hasattr(m, "k_cache"))
         dtype = next(self.model.parameters()).dtype
 
         fi_decode = fi_prefill = None
@@ -583,30 +639,66 @@ class ModelRunner:
         # A single-token prompt's prefill has cu_k == cu_q, so no block
         # tables are built (raw k/v is exactly the full KV there); the
         # graph-replay path needs them — fall back to eager for that step.
-        if (not is_uniform_decode or self.enforce_eager or input_ids.size(0) > 512
-                or context.block_tables is None):
-            return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
+        use_graph = (is_uniform_decode and not self.enforce_eager
+                     and input_ids.size(0) <= 512
+                     and context.block_tables is not None)
+        if not use_graph:
+            hidden_states = residual = None
+            if self.pp_rank > 0:
+                shape = (input_ids.size(0), self.config.hf_config.hidden_size)
+                dtype = self.config.hf_config.dtype
+                hidden_states = torch.empty(shape, dtype=dtype, device="cuda")
+                residual = torch.empty(shape, dtype=dtype, device="cuda")
+                dist.recv(hidden_states, src=self.pp_peer_prev)
+                dist.recv(residual, src=self.pp_peer_prev)
+            out = self.model(input_ids, positions,
+                             hidden_states=hidden_states, residual=residual)
+            if not self.is_last_stage:
+                hidden_states, residual = out
+                dist.send(hidden_states, dst=self.pp_peer_next)
+                dist.send(residual, dst=self.pp_peer_next)
+                return None
+            return self.model.compute_logits(out)
+        bs = input_ids.size(0)
+        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        graph_vars = self.graph_vars
+        if self.pp_rank == 0:
             graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["cu_seqlens_q"].zero_()
-            graph_vars["cu_seqlens_q"][:bs + 1] = torch.arange(bs + 1, dtype=torch.int32)
-            graph_vars["cu_seqlens_k"].zero_()
-            graph_vars["cu_seqlens_k"][:bs + 1] = context.cu_seqlens_k
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            if "linear_state_ids" in graph_vars:
-                graph_vars["linear_state_ids"][:bs] = context.linear_state_ids
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+        graph_vars["positions"][:bs] = positions
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        graph_vars["cu_seqlens_q"].zero_()
+        graph_vars["cu_seqlens_q"][:bs + 1] = torch.arange(bs + 1, dtype=torch.int32)
+        graph_vars["cu_seqlens_k"].zero_()
+        graph_vars["cu_seqlens_k"][:bs + 1] = context.cu_seqlens_k
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        if "linear_state_ids" in graph_vars:
+            graph_vars["linear_state_ids"][:bs] = context.linear_state_ids
+        if self.pp_rank > 0:
+            dist.recv(graph_vars["hidden_in"][:bs], src=self.pp_peer_prev)
+            dist.recv(graph_vars["residual_in"][:bs], src=self.pp_peer_prev)
+        graph.replay()
+        if not self.is_last_stage:
+            dist.send(graph_vars["outputs"][:bs], dst=self.pp_peer_next)
+            dist.send(graph_vars["residual_out"][:bs], dst=self.pp_peer_next)
+            return None
+        return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     # ------------------------------------------------------------------
     # Synchronous API
     # ------------------------------------------------------------------
+
+    def _sample_tokens(self, logits, sample_params, bs: int) -> list[int] | None:
+        """Sample on the (last stage, tp 0) rank; with PP, broadcast the
+        tokens so group rank 0 — the driver-side runner feeding the
+        scheduler — gets them too."""
+        if self.rank == self.sampler_rank:
+            tokens = self.sampler(logits, *sample_params)
+        else:
+            tokens = torch.empty(bs, dtype=torch.int64, device="cuda")
+        if self.pp_size > 1:
+            dist.broadcast(tokens, src=self.sampler_rank)
+        return tokens.tolist() if self.rank == 0 else None
 
     def run(self, seqs: list[Sequence]) -> list[int]:
         if not seqs:
@@ -616,7 +708,7 @@ class ModelRunner:
             # work anyway.
             return None
         input_ids, positions, is_uniform = self.prepare_batch(seqs)
-        sample_params = self.prepare_sample(seqs) if self.rank == 0 else None
+        sample_params = self.prepare_sample(seqs) if self.rank == self.sampler_rank else None
         logits = self.run_model(input_ids, positions, is_uniform)
         if self.draft_model is not None and any(s.is_prefill and s.block_table for s in seqs):
             if self.use_dflash_draft:
@@ -640,7 +732,7 @@ class ModelRunner:
                 # draft KV (the draft model reads its own cache during
                 # speculation).
                 self._run_draft_mirror(seqs, input_ids, positions)
-        token_ids = self.sampler(logits, *sample_params).tolist() if self.rank == 0 else None
+        token_ids = self._sample_tokens(logits, sample_params, len(seqs))
         reset_context()
         return token_ids
 
@@ -981,7 +1073,8 @@ class ModelRunner:
         self._async_positions = positions
         self._async_is_uniform = is_uniform
         self._async_seqs = seqs
-        self._async_sample_params = self.prepare_sample(seqs) if self.rank == 0 else None
+        self._async_sample_params = (
+            self.prepare_sample(seqs) if self.rank == self.sampler_rank else None)
 
     def execute_model(self):
         """Phase 2: launch forward pass (non-blocking on GPU)."""
@@ -991,10 +1084,9 @@ class ModelRunner:
 
     def sample(self) -> list[int] | None:
         """Phase 3: synchronise GPU and sample tokens."""
-        if self.rank == 0:
-            token_ids = self.sampler(self._async_logits, *self._async_sample_params).tolist()
-        else:
-            token_ids = None
+        token_ids = self._sample_tokens(
+            self._async_logits, self._async_sample_params,
+            self._async_input_ids.size(0))
         reset_context()
         return token_ids
 
@@ -1030,6 +1122,19 @@ class ModelRunner:
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
+        # Pipeline stages: intermediate/later stages receive (hidden,
+        # residual) from the peer instead of input ids; non-last stages
+        # additionally emit the residual alongside the hidden output.
+        # (Draft captures run under pp == 1 — spec asserts it — so both
+        # flags are True there and the buffers stay identical to before.)
+        pp_first = is_first_pp_stage()
+        pp_last = is_last_pp_stage()
+        hidden_in = residual_in = residual_out = None
+        if not pp_first:
+            hidden_in = torch.zeros(max_bs, hf_config.hidden_size)
+            residual_in = torch.zeros(max_bs, hf_config.hidden_size)
+        if not pp_last:
+            residual_out = torch.zeros(max_bs, hf_config.hidden_size)
         # Linear-attention state slot ids (hybrid models); the recurrent
         # update inside the graph reads/writes fixed pool addresses, only
         # this id buffer's contents change between replays.
@@ -1052,6 +1157,19 @@ class ModelRunner:
             # (skip_layers) reuses it.
             self.graph_pool = None
 
+        def stage_forward(bs: int):
+            if hidden_in is None:
+                return model(input_ids[:bs], positions[:bs], skip_layers=skip_layers)
+            return model(input_ids[:bs], positions[:bs], skip_layers=skip_layers,
+                         hidden_states=hidden_in[:bs], residual=residual_in[:bs])
+
+        def store_outputs(out, bs: int):
+            if isinstance(out, tuple):
+                outputs[:bs] = out[0]
+                residual_out[:bs] = out[1]
+            else:
+                outputs[:bs] = out
+
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             cu_seqlens_q[:bs + 1] = torch.arange(bs + 1, dtype=torch.int32)
@@ -1070,11 +1188,9 @@ class ModelRunner:
                             slot_mapping[:bs], block_tables[:bs],
                             linear_state_ids=(linear_state_ids[:bs]
                                               if linear_state_ids is not None else None))
-            outputs[:bs] = model(input_ids[:bs], positions[:bs],
-                                 skip_layers=skip_layers)  # warmup
+            store_outputs(stage_forward(bs), bs)  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = model(input_ids[:bs], positions[:bs],
-                                     skip_layers=skip_layers)  # capture
+                store_outputs(stage_forward(bs), bs)  # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             graphs[bs] = graph
@@ -1090,6 +1206,11 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+        if hidden_in is not None:
+            graph_vars["hidden_in"] = hidden_in
+            graph_vars["residual_in"] = residual_in
+        if residual_out is not None:
+            graph_vars["residual_out"] = residual_out
         if linear_state_ids is not None:
             graph_vars["linear_state_ids"] = linear_state_ids
         return graphs, graph_vars

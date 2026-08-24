@@ -1,6 +1,35 @@
 import torch
 from torch import nn
 
+# Compiled free functions with (weight, eps) passed explicitly: instance-
+# method @torch.compile guards on `self`, so the per-layer instances each
+# recompile and exhaust the dynamo cache (8 entries) — every call after
+# that runs eager under guard overhead, and later CUDA graphs bake the
+# fallback.  One dynamic-shape kernel serves all instances and shapes.
+
+
+@torch.compile(dynamic=True)
+def _rms_forward(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    orig_dtype = x.dtype
+    x = x.float()
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    x.mul_(torch.rsqrt(var + eps))
+    x = x.to(orig_dtype).mul_(weight)
+    return x
+
+
+@torch.compile(dynamic=True)
+def _add_rms_forward(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    orig_dtype = x.dtype
+    x = x.float().add_(residual.float())
+    residual = x.to(orig_dtype)
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    x.mul_(torch.rsqrt(var + eps))
+    x = x.to(orig_dtype).mul_(weight)
+    return x, residual
+
 
 class RMSNorm(nn.Module):
 
@@ -13,31 +42,18 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    @torch.compile
     def rms_forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        orig_dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x
+        return _rms_forward(x, self.weight, self.eps)
 
-    @torch.compile
     def add_rms_forward(
         self,
         x: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        orig_dtype = x.dtype
-        x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x, residual
+        return _add_rms_forward(x, residual, self.weight, self.eps)
 
     def forward(
         self,

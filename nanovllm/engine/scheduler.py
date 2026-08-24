@@ -53,6 +53,16 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        # Length-biased insertion (longest-first, stable): the hybrid
+        # model's linear-attention layers pad each batch to [bs, T=max
+        # len], so grouping similar lengths keeps the padded fill ratio
+        # near 1.0 (random mixed-length batches average ~0.6, wasting GEMM
+        # + GDN compute on padding).  Equal lengths keep arrival order.
+        n = seq.num_tokens
+        for i in range(len(self.waiting)):
+            if self.waiting[i].num_tokens < n:
+                self.waiting.insert(i, seq)
+                return
         self.waiting.append(seq)
 
     # ------------------------------------------------------------------
