@@ -19,6 +19,9 @@ from nanovllm.utils.parallel import (
     init_parallel_state, is_first_pp_stage, is_last_pp_stage)
 
 
+_SHM_DEBUG = bool(os.environ.get("NANO_SHM_DEBUG"))
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event],
@@ -138,6 +141,26 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        # ── Async scheduling: GPU-side sampled-token ring ──
+        # vLLM-V1-style async scheduling keeps sampled tokens on the GPU:
+        # the next decode step gathers its input ids from the previous
+        # step's ring slot on-device, and results return to the CPU via an
+        # async D2H into pinned memory plus a CUDA event the engine polls.
+        # Allocated on every rank: TP workers gather input ids from their
+        # own slot (filled by broadcast), PP groups broadcast from the
+        # sampling rank.
+        if config.async_scheduling:
+            n = config.max_num_batched_tokens
+            self._ring_size = 4
+            self._ring_cursor = 0
+            self._sampled_ring = [
+                torch.empty(n, dtype=torch.int64, device="cuda")
+                for _ in range(self._ring_size)]
+            self._pinned_ring = [
+                torch.empty(n, dtype=torch.int64, pin_memory=True)
+                for _ in range(self._ring_size)]
+            self._event_ring = [torch.cuda.Event() for _ in range(self._ring_size)]
+
         if self.world_size > 1:
             # One shm segment per replica group (keyed by the group's
             # rendezvous port, unique per DP replica).
@@ -181,6 +204,10 @@ class ModelRunner:
         # only writes the next command after every worker acked).
         self.event.clear()
         self.ack.set()
+        if _SHM_DEBUG:
+            print(f"[shm w{self.rank}] RECV {method_name} "
+                  f"({[len(a) if isinstance(a, list) else a for a in args][:3]})",
+                  flush=True)
         return method_name, args
 
     def write_shm(self, method_name, *args):
@@ -200,6 +227,10 @@ class ModelRunner:
         self.shm.buf[4:n+4] = data
         for event in self.event:
             event.set()
+        if _SHM_DEBUG:
+            print(f"[shm r0] SEND {method_name} "
+                  f"({[len(a) if isinstance(a, list) else a for a in args][:3]})",
+                  flush=True)
 
     def call(self, method_name, *args):
         if self.world_size > 1 and self.rank == 0:
@@ -1063,9 +1094,10 @@ class ModelRunner:
     _async_is_uniform: bool = False
     _async_sample_params: tuple | torch.Tensor | None = None
     _async_logits: torch.Tensor | None = None
+    _async_bs: int = 0    # sequences in the batch (rows the sampler emits)
 
     def prepare_step(self, seqs: list[Sequence]):
-        """Phase 1: prepare metadata tensors and set global context."""
+        """Phase 1 (synchronous batches): prepare from CPU token state."""
         if not seqs:
             return  # starved schedule — skip this step
         input_ids, positions, is_uniform = self.prepare_batch(seqs)
@@ -1073,6 +1105,7 @@ class ModelRunner:
         self._async_positions = positions
         self._async_is_uniform = is_uniform
         self._async_seqs = seqs
+        self._async_bs = len(seqs)
         self._async_sample_params = (
             self.prepare_sample(seqs) if self.rank == self.sampler_rank else None)
 
@@ -1083,12 +1116,98 @@ class ModelRunner:
         )
 
     def sample(self) -> list[int] | None:
-        """Phase 3: synchronise GPU and sample tokens."""
+        """Phase 3 (synchronous batches): synchronise GPU and sample tokens."""
         token_ids = self._sample_tokens(
             self._async_logits, self._async_sample_params,
             self._async_input_ids.size(0))
         reset_context()
         return token_ids
+
+    # ------------------------------------------------------------------
+    # Async scheduling (vLLM V1 style): the CPU never waits for the GPU.
+    # Steady-state decode steps swap the CPU token round-trip for an
+    # on-device gather from the previous step's sampled-token ring slot.
+    # ------------------------------------------------------------------
+
+    def begin_ring_slot(self) -> int:
+        """Reserve the next ring slot (driver-side only, no shm)."""
+        idx = self._ring_cursor % self._ring_size
+        self._ring_cursor += 1
+        return idx
+
+    def prepare_step_async(self, seqs: list[Sequence], src_ring_idx: int,
+                           prev_rows: list[int]):
+        """Pure-decode batch preparation with GPU-side input gather.
+
+        Row i's input token is the token sampled for it by the *source*
+        step — still on GPU, never touched by the CPU.  Everything else
+        (positions, KV slots, cu_seqlens) derives from scheduler metadata
+        through ``num_computed_tokens`` (placeholder-inclusive), so any
+        scheduling lag is transparent.  Contains no GPU synchronisation.
+        """
+        assert seqs, "empty batch in prepare_step_async"
+        bs = len(seqs)
+        block_size = self.block_size
+        computed = [s.num_computed_tokens for s in seqs]   # ≥ 1: schedule reserved this step
+        rows = torch.tensor(prev_rows, dtype=torch.int64,
+                            pin_memory=True).cuda(non_blocking=True)
+        input_ids = self._sampled_ring[src_ring_idx][rows]      # device gather
+        positions = torch.tensor([c - 1 for c in computed], dtype=torch.int64,
+                                 pin_memory=True).cuda(non_blocking=True)
+        slots = [s.block_table[(c - 1) // block_size] * block_size + (c - 1) % block_size
+                 for s, c in zip(seqs, computed)]
+        slot_mapping = torch.tensor(slots, dtype=torch.int32,
+                                    pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
+        cu_k = [0]
+        for c in computed:
+            cu_k.append(cu_k[-1] + c)
+        cu_seqlens_k = torch.tensor(cu_k, dtype=torch.int32,
+                                    pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        linear_state_ids = self._linear_state_context(seqs)
+        set_context(cu_seqlens_q, cu_seqlens_k, 1, max(computed),
+                    slot_mapping, block_tables, bs, None, None,
+                    linear_state_ids=linear_state_ids)
+        self._async_input_ids = input_ids
+        self._async_positions = positions
+        self._async_is_uniform = True
+        self._async_seqs = seqs
+        self._async_bs = bs
+        self._async_sample_params = (
+            self.prepare_sample(seqs) if self.rank == self.sampler_rank else None)
+
+    def sample_async(self, ring_idx: int):
+        """Sample into the GPU token ring — never blocks on the GPU.
+
+        The sampler writes the ring slot on the sampling rank; the slot is
+        broadcast to every rank (NCCL collective: CPU returns after
+        enqueue, stream-ordered w.r.t. later kernels), and rank 0 kicks
+        off an async D2H into pinned memory guarded by a CUDA event the
+        engine polls later.
+        """
+        bs = self._async_bs
+        slot = self._sampled_ring[ring_idx]
+        if self.rank == self.sampler_rank:
+            tokens = self.sampler(self._async_logits, *self._async_sample_params)
+            slot[:bs] = tokens
+        if self.world_size > 1:
+            dist.broadcast(slot, src=self.sampler_rank)
+        if self.rank == 0:
+            self._pinned_ring[ring_idx][:bs].copy_(slot[:bs], non_blocking=True)
+            self._event_ring[ring_idx].record()
+        reset_context()
+
+    def poll_sampled(self, ring_idx: int, bs: int) -> list[int] | None:
+        """Non-blocking check for a step's sampled tokens (rank 0 only)."""
+        if self._event_ring[ring_idx].query():
+            return self._pinned_ring[ring_idx][:bs].tolist()
+        return None
+
+    def wait_sampled(self, ring_idx: int, bs: int) -> list[int]:
+        """Blocking variant used when draining the pipeline."""
+        self._event_ring[ring_idx].synchronize()
+        return self._pinned_ring[ring_idx][:bs].tolist()
 
     def free_finished_gpu_rows(self, seqs: list[Sequence]):
         """Release GPU table rows for finished sequences."""

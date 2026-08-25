@@ -1,5 +1,6 @@
 import atexit
-from dataclasses import fields
+from collections import deque
+from dataclasses import dataclass, field, fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -12,6 +13,20 @@ from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.scheduler import Scheduler, SchedulerOutput
 from nanovllm.engine.async_scheduler import AsyncScheduler
 from nanovllm.engine.model_runner import ModelRunner
+
+
+@dataclass
+class _InflightStep:
+    """One GPU step launched but whose sampled tokens are not yet
+    processed on the CPU (reaped when its CUDA event fires)."""
+    ring_idx: int
+    seqs: list[Sequence]
+    # seq_id -> row in this step's batch: the gather source map for the
+    # next step's on-device input assembly.
+    row_of: dict[int, int] = field(default_factory=dict)
+    # Finished sequences whose KV/slot/GPU-row release must wait for this
+    # step (the last one still referencing them) to complete.
+    deferred_free: list[Sequence] = field(default_factory=list)
 
 
 def dp_engine_worker(config: Config, dp_idx: int, req_queue, result_queue):
@@ -38,6 +53,8 @@ def dp_engine_worker(config: Config, dp_idx: int, req_queue, result_queue):
                     finished, _ = engine.step()
                     for seq_id, tokens in finished:
                         result_queue.put(("finished", seq_to_req.pop(seq_id), tokens))
+                for seq_id, tokens in engine.drain():
+                    result_queue.put(("finished", seq_to_req.pop(seq_id), tokens))
                 result_queue.put(("round_done", dp_idx))
     finally:
         engine.exit()
@@ -101,8 +118,9 @@ class LLMEngine:
         else:
             self.scheduler = Scheduler(config)
 
-        # Async scheduling state.
-        self._pending_seqs: list[Sequence] | None = None
+        # Async scheduling state: in-flight steps awaiting CPU-side
+        # output processing (bounded pipeline depth of 2).
+        self._inflight: deque[_InflightStep] = deque()
 
     def _init_data_parallel(self, config: Config):
         """Data parallelism: dp replica processes, each a full engine on its
@@ -188,54 +206,124 @@ class LLMEngine:
         return finished, num_tokens
 
     # ------------------------------------------------------------------
-    # Asynchronous step
+    # Asynchronous step (vLLM V1 style)
+    #
+    # Steady-state decode never blocks the CPU on the GPU: while step N
+    # executes, the CPU schedules step N+1, builds its metadata, gathers
+    # its input ids ON DEVICE from step N's sampled-token ring slot, and
+    # enqueues execute + sample.  Outputs come back through pinned memory
+    # guarded by CUDA events and are processed (token append, EOS/finish
+    # detection) one to two steps late, off the critical path.  Batches
+    # containing prefill chunks (and preemption, which accompanies them)
+    # fall out of the async pipeline entirely: the pipeline is drained
+    # and the step runs synchronously with a caught-up scheduler.
     # ------------------------------------------------------------------
 
     def _step_async(self):
-        """Async step with CPU-scheduling / GPU-execution overlap.
+        finished_all = []
+        mr = self.model_runner
 
-        For continuous batching the overlap only applies to uniform-decode
-        steps; mixed (prefill+decode) steps fall back to synchronous
-        execution.
-        """
+        # 1) Reap completed steps, oldest first.
+        while self._inflight:
+            step = self._inflight[0]
+            tokens = mr.poll_sampled(step.ring_idx, len(step.seqs))
+            if tokens is None:
+                break
+            self._inflight.popleft()
+            self._process_async_output(step, tokens, finished_all)
+
+        # 2) Pipeline depth cap: schedule() below reserves KV placeholders
+        #    per step, so never queue more than 2 steps ahead.
+        if len(self._inflight) >= 2:
+            return finished_all, 0
+
+        # 3) Schedule and launch the next step.
         output: SchedulerOutput = self.scheduler.schedule()
         seqs = output.scheduled_seqs
-        all_finished = []
+        if not seqs:
+            return finished_all, output.num_scheduled_tokens
 
         if output.is_prefill:
-            # Mixed or pure-prefill batch — synchronous execution.
-            self.model_runner.call("prepare_step", seqs)
-            self.model_runner.call("execute_model")
-            token_ids = self.model_runner.call("sample")
-            self.scheduler.update_from_output(seqs, token_ids, output.is_prefill)
-            self.model_runner.call("free_finished_gpu_rows", seqs)
-            for seq in seqs:
-                if seq.is_finished:
-                    all_finished.append((seq.seq_id, seq.completion_token_ids))
-            self._pending_seqs = None
-        else:
-            # Pure-decode batch — async overlap.
-            if self._pending_seqs is not None:
-                token_ids = self.model_runner.call("sample")
-                self.scheduler.update_from_output(
-                    self._pending_seqs, token_ids, False,
-                )
-                self.model_runner.call("free_finished_gpu_rows", self._pending_seqs)
-                for seq in self._pending_seqs:
-                    if seq.is_finished:
-                        all_finished.append((seq.seq_id, seq.completion_token_ids))
-
-            # Filter out sequences that finished in the update above.
+            # Prefill chunks run fully synchronously (vLLM does the same):
+            # their prompt tokens live on the CPU, chunk accounting needs a
+            # caught-up scheduler, and preemption may shuffle blocks — so
+            # drain the pipeline, execute, and process outputs before the
+            # next schedule.  Only pure-decode steps enter the async
+            # pipeline, which keeps the invariant that every un-reaped
+            # scheduled token of a seq is exactly one placeholder.
+            self._drain_inflight(finished_all)
             seqs = [s for s in seqs if not s.is_finished]
-
-            if seqs:
-                self.model_runner.call("prepare_step", seqs)
-                self.model_runner.call("execute_model")
-                self._pending_seqs = seqs
+            if not seqs:
+                return finished_all, output.num_scheduled_tokens
+            # Single-command execution ("run" = prepare+execute+sample):
+            # the split three-command form (prepare_step / execute_model /
+            # sample) deadlocks under pipeline parallelism — with the
+            # sample's PP broadcast issued as its own shm command, the
+            # driver's tolist() wait never resolves (pre-existing; HEAD
+            # hangs the same way).  Prefill steps are synchronous anyway,
+            # so one command is both correct and cheaper.
+            token_ids = mr.call("run", seqs)
+            finished = self.scheduler.update_from_output(
+                seqs, token_ids, output.is_prefill)
+            finished_all.extend(
+                (s.seq_id, s.completion_token_ids) for s in finished)
+            self._release(finished)
+            return finished_all, output.num_scheduled_tokens
+        else:
+            seqs = [s for s in seqs if not s.is_finished]
+            if not seqs:
+                return finished_all, output.num_scheduled_tokens
+            if self._inflight:
+                src = self._inflight[-1]
+                if all(s.seq_id in src.row_of for s in seqs):
+                    # Steady state: gather input ids from the previous
+                    # step's ring slot — the CPU never sees the tokens.
+                    prev_rows = [src.row_of[s.seq_id] for s in seqs]
+                    mr.call("prepare_step_async", seqs, src.ring_idx, prev_rows)
+                else:
+                    # A decode seq absent from the source batch (budget
+                    # exclusion): fall back to a drained synchronous step.
+                    self._drain_inflight(finished_all)
+                    mr.call("prepare_step", seqs)
             else:
-                self._pending_seqs = None
+                # First decode step after a synchronous step — tokens are
+                # already on the CPU, plain prepare is exact.
+                mr.call("prepare_step", seqs)
 
-        return all_finished, output.num_scheduled_tokens
+        mr.call("execute_model")
+        ring_idx = mr.begin_ring_slot()
+        mr.call("sample_async", ring_idx)
+        self._inflight.append(_InflightStep(
+            ring_idx, seqs, {s.seq_id: i for i, s in enumerate(seqs)}))
+        return finished_all, output.num_scheduled_tokens
+
+    def _process_async_output(self, step: _InflightStep, tokens: list[int],
+                              finished_all: list):
+        """Apply a reaped step's tokens; defer releases of sequences that
+        newer in-flight steps still reference (the wasted extra row)."""
+        finished = self.scheduler.update_from_output(step.seqs, tokens, False)
+        finished_all.extend(
+            (s.seq_id, s.completion_token_ids) for s in finished)
+        if finished:
+            if self._inflight:
+                self._inflight[-1].deferred_free.extend(finished)
+            else:
+                self._release(finished)
+        if step.deferred_free:
+            self._release(step.deferred_free)
+
+    def _release(self, seqs: list[Sequence]):
+        for seq in seqs:
+            self.scheduler.release(seq)
+        self.model_runner.call("free_finished_gpu_rows", seqs)
+
+    def _drain_inflight(self, finished_all: list):
+        """Wait for every in-flight step and process its outputs."""
+        while self._inflight:
+            step = self._inflight.popleft()
+            tokens = self.model_runner.wait_sampled(
+                step.ring_idx, len(step.seqs))
+            self._process_async_output(step, tokens, finished_all)
 
     # ------------------------------------------------------------------
     # Public API
@@ -255,6 +343,15 @@ class LLMEngine:
             raise NotImplementedError(
                 "data parallelism supports generate() only — state lives inside the replica workers")
         return self.scheduler.is_finished()
+
+    def drain(self) -> list[tuple[int, list[int]]]:
+        """Process the trailing in-flight steps after the last step():
+        each finished sequence runs one wasted extra step, so its KV
+        blocks / GPU rows are only released here."""
+        tail: list[tuple[int, list[int]]] = []
+        if self.async_scheduling:
+            self._drain_inflight(tail)
+        return tail
 
     def generate(
         self,
@@ -337,6 +434,11 @@ class LLMEngine:
             for seq_id, token_ids in finished:
                 outputs[seq_id] = token_ids
                 pbar.update(1)
+        # Drain the trailing in-flight steps: releases their KV blocks /
+        # GPU rows and reports finishes detected in the very last steps.
+        for seq_id, token_ids in self.drain():
+            outputs[seq_id] = token_ids
+            pbar.update(1)
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]

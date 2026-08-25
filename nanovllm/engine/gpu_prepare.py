@@ -62,8 +62,12 @@ def gather_tokens_kernel(
         token_pos = nc + li
         kv_pos = token_pos
     else:
+        # Decode: num_computed is placeholder-inclusive, so the input
+        # token sits at num_computed-1 and its KV is written to the same
+        # slot — correct for any scheduling lag (with lag 1 this equals
+        # num_cached, the value the CPU prepare path uses).
         token_pos = nc_total - 1
-        kv_pos = nc
+        kv_pos = nc_total - 1
 
     token = tl.load(token_ids_ptr + seq_idx * stride_tokens + token_pos)
     tl.store(out_input_ids_ptr + pid, token)

@@ -19,7 +19,7 @@ def main():
         enforce_eager=False,
         max_model_len=4096,
         # collect_timing=True,
-        data_parallel_size=2
+        # data_parallel_size=2
         # sampling_backend="flashinfer"
         # attention_backend="flashinfer"
     )
