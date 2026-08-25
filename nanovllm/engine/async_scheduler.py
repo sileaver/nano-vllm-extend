@@ -26,12 +26,14 @@ class AsyncScheduler(Scheduler):
     def schedule(self) -> SchedulerOutput:
         output = super().schedule()
 
-        # Only add placeholders for pure-decode batches.  Mixed batches
-        # (prefill + decode) are executed synchronously in the engine so
-        # no placeholders are needed.
-        if not output.is_prefill:
-            for seq in output.scheduled_seqs:
-                seq.num_output_placeholders += self.num_sampled_tokens_per_step
+        # EVERY scheduled row reserves its token count as placeholders, so
+        # num_computed_tokens (= num_cached + placeholders) is the true
+        # next-free KV position under any output-processing lag.  Prefill
+        # batches enter the async pipeline like decode batches (the engine
+        # no longer drains for them), which is what makes chunk
+        # continuation and decode-on-top-of-unreaped-prefill both correct.
+        for seq in output.scheduled_seqs:
+            seq.num_output_placeholders += seq.num_scheduled_tokens
 
         return output
 
@@ -43,23 +45,32 @@ class AsyncScheduler(Scheduler):
         self,
         seqs: list[Sequence],
         token_ids: list[int],
-        is_prefill: bool,
+        sched_counts: list[int] | None = None,
+        pf_flags: list[bool] | None = None,
     ) -> list[Sequence]:
         """Apply one step's sampled tokens; returns sequences that just
-        finished.  The CALLER owns releasing their KV blocks / state slots
-        / GPU rows: with async scheduling a finished sequence may still be
-        referenced by newer in-flight steps, so release() must be deferred
-        until the last of them completes (see LLMEngine).
+        finished.  ``sched_counts`` / ``pf_flags`` snapshot each row's
+        chunk size and prefill-ness AT LAUNCH TIME — required with lagged
+        processing, because a later schedule may have overwritten
+        ``seq.num_scheduled_tokens`` / ``seq.is_prefill`` before this
+        step's output is reaped.  The CALLER owns releasing finished
+        sequences' KV blocks: they may still be referenced by newer
+        in-flight steps (see LLMEngine).
         """
         finished: list[Sequence] = []
-        for seq, token_id in zip(seqs, token_ids):
+        for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
             if seq.is_finished:
                 # Optimistic scheduling ran this sequence one extra step
                 # after its actual finish — the row is simply discarded.
                 continue
-            if seq.is_prefill:
-                num_scheduled = seq.num_scheduled_tokens
+            was_prefill = (pf_flags[i] if pf_flags is not None
+                           else seq.is_prefill)
+            num_scheduled = (sched_counts[i] if sched_counts is not None
+                             else seq.num_scheduled_tokens)
+            if was_prefill:
                 self.block_manager.hash_blocks(seq, num_scheduled)
+                if seq.num_output_placeholders >= num_scheduled:
+                    seq.num_output_placeholders -= num_scheduled
                 seq.num_cached_tokens += num_scheduled
                 seq.num_scheduled_tokens = 0
             else:
@@ -72,8 +83,8 @@ class AsyncScheduler(Scheduler):
                 # Leave num_scheduled_tokens for the next async step.
 
             # Chunked prefill: don't append token until all prompt tokens
-            # are processed.
-            if seq.is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            # are processed (was_prefill: the launch-time row type).
+            if was_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
 
             seq.append_token(token_id)
@@ -85,14 +96,20 @@ class AsyncScheduler(Scheduler):
                 seq.status = SequenceStatus.FINISHED
                 if seq in self.running:
                     self.running.remove(seq)
+                # Free the linear-attention state slot immediately: its
+                # zero-on-next-use happens in a fresh prefill's prepare,
+                # which only runs after the pipeline drained — strictly
+                # later than any in-flight step's reads.  Deferring it
+                # would break admission accounting (running count drops
+                # but the slot stays held → pool exhaustion assert).
+                self._free_state_slot(seq)
                 finished.append(seq)
         return finished
 
     def release(self, seq: Sequence):
-        """Free a finished sequence's KV blocks and state slot (deferred
-        until no in-flight step references it)."""
+        """Free a finished sequence's KV blocks (deferred until no
+        in-flight step's block-table copy could still reference them)."""
         self.block_manager.deallocate(seq)
-        self._free_state_slot(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq in self.update_from_output(seqs, token_ids, is_prefill):

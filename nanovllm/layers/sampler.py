@@ -1,7 +1,67 @@
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 
 from nanovllm.utils.flashinfer_env import setup_flashinfer_env
+
+
+@triton.jit
+def _gumbel_argmax_stage1(
+    LOGITS, TEMPS, SEED, PMAX, PIDX, V, NB,
+    sL, BLOCK_V: tl.constexpr,
+):
+    """Stage 1: each program scores one [BLOCK_V] vocab slice of one row.
+
+    score = logits[row, v] / temp[row] + g, g = -ln(-ln(u)), u ~ U(0,1)
+    via philox — the same estimator as Sampler._forward_torch
+    (argmax(l/T − ln e), e ~ Exp(1)) fused over the bf16 logits with no
+    fp32 [bs, V] materialisation.  Writes per-slice (max, argmax) for the
+    tiny stage-2 reduction.  The seed lives in GPU memory and is bumped
+    by the caller between CUDA-graph replays (fresh noise every step).
+    """
+    row = tl.program_id(0)
+    pv = tl.program_id(1)
+    offs = pv * BLOCK_V + tl.arange(0, BLOCK_V)
+    m = offs < V
+    l = tl.load(LOGITS + row * sL + offs, mask=m, other=-float("inf")).to(tl.float32)
+    temp = tl.load(TEMPS + row)
+    seed = tl.load(SEED)
+    u = tl.rand(seed, (offs + row * V).to(tl.int32))
+    u = tl.minimum(tl.maximum(u, 1e-10), 1.0 - 1e-6)
+    g = -tl.log(-tl.log(u))
+    score = l / temp + g
+    score = tl.where(m, score, -float("inf"))
+    tl.store(PMAX + row * NB + pv, tl.max(score, axis=0))
+    tl.store(PIDX + row * NB + pv, tl.argmax(score, axis=0) + pv * BLOCK_V)
+
+
+@triton.jit
+def _gumbel_argmax_stage2(PMAX, PIDX, OUT, NB, NB_PAD: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, NB_PAD)
+    m = offs < NB
+    mx = tl.load(PMAX + row * NB + offs, mask=m, other=-float("inf"))
+    ix = tl.load(PIDX + row * NB + offs, mask=m, other=0)
+    loc = tl.argmax(mx, axis=0)
+    tl.store(OUT + row, tl.sum(tl.where(offs == loc, ix, 0)))
+
+
+def gumbel_argmax(logits: torch.Tensor, temps: torch.Tensor,
+                  out: torch.Tensor, seed: torch.Tensor,
+                  pmax: torch.Tensor, pidx: torch.Tensor):
+    """logits [bs, V] bf16 (row-contiguous), temps [≥bs] fp32, seed int32
+    scalar tensor (value must differ between CUDA-graph replays);
+    pmax/pidx [≥bs, NB] fp32/int32 scratch (NB = cdiv(V, 2048))."""
+    assert logits.stride(1) == 1
+    bs, vocab = logits.shape
+    nb = pmax.shape[1]
+    nb_pad = triton.next_power_of_2(nb)
+    _gumbel_argmax_stage1[(bs, nb)](
+        logits, temps, seed, pmax, pidx, vocab, nb,
+        logits.stride(0), BLOCK_V=2048, num_warps=8,
+    )
+    _gumbel_argmax_stage2[(bs,)](pmax, pidx, out, nb, NB_PAD=nb_pad)
 
 
 class Sampler(nn.Module):

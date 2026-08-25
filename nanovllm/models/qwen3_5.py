@@ -69,6 +69,20 @@ _USE_FLA_CHUNK = _HAS_FLA and _os.environ.get("FLA_CHUNK", "1") == "1"
 # restores the gather → recurrent → scatter reference path).
 _USE_GDN_INPLACE = _os.environ.get("NANOVLLM_GDN_INPLACE", "1") == "1"
 
+# FlashInfer fused kernels for the norm / activation sites (the same
+# kernels vLLM uses): gemma_rmsnorm / gemma_fused_add_rmsnorm cover the
+# (1 + w) Gemma semantics natively, silu_and_mul replaces the compiled
+# MLP activation.  NANOVLLM_FI_NORM=0 falls back to the torch.compile'd
+# reference paths.
+try:
+    import flashinfer.norm as _fi_norm
+    import flashinfer.activation as _fi_act
+    _HAS_FI_NORM = True
+except ImportError:
+    _fi_norm = _fi_act = None
+    _HAS_FI_NORM = False
+_USE_FI_NORM = _HAS_FI_NORM and _os.environ.get("NANOVLLM_FI_NORM", "1") == "1"
+
 
 # ── Shared dynamic-shape compiled kernels (see class docstrings: instance
 # method compiles exhaust the dynamo recompile cache and fall back to
@@ -225,6 +239,223 @@ def recurrent_gated_delta_rule(query, key, value, g, beta, initial_state=None):
 # l2-normalised with eps 1e-6 then q scaled by DK^-0.5).
 
 @triton.jit
+def _causal_conv_silu_kernel(
+    X, S, W, Y, ENDP,                       # in: x [n,C,T], state [n,C,K-1], w [C,K]; out: y [n,C,T]
+    T, C,
+    sXn, sXc, sXt, sSn, sSc, sYn, sYc, sYt,
+    K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
+):
+    """Depthwise causal conv + SiLU with in-place state roll.
+
+    y[n,c,t] = silu(Σᵢ w[c,i]·win[t−K+1+i]) with win = [state | x]
+    (state serves as the K−1 left-padding).  After the T loop, the row's
+    new conv state (its last K−1 inputs at ENDP — the row's last real
+    position in this call, not the padded tail) is written back INTO S
+    in place; each program only reads S entries it wrote after reading
+    them, and rows/channels partition the grid, so the in-place update
+    is race-free.  ENDP < 0 skips the writeback (padding-only row).
+    """
+    n = tl.program_id(0)
+    pc = tl.program_id(1)
+    offs_c = pc * BLOCK_C + tl.arange(0, BLOCK_C)
+    cm = offs_c < C
+    Xn = X + n * sXn
+    Sn = S + n * sSn
+    Yn = Y + n * sYn
+    for t0 in range(0, T, BLOCK_T):
+        offs_t = t0 + tl.arange(0, BLOCK_T)
+        acc = tl.zeros((BLOCK_C, BLOCK_T), dtype=tl.float32)
+        for i in tl.static_range(K):
+            p = offs_t - (K - 1) + i
+            xv = tl.load(Xn + offs_c[:, None] * sXc + p[None, :] * sXt,
+                         mask=cm[:, None] & (p >= 0)[None, :] & (p < T)[None, :],
+                         other=0.0)
+            sv = tl.load(Sn + offs_c[:, None] * sSc + (p + (K - 1))[None, :],
+                         mask=cm[:, None] & (p < 0)[None, :], other=0.0)
+            w_i = tl.load(W + offs_c * K + i, mask=cm, other=0.0).to(tl.float32)
+            acc += (xv.to(tl.float32) + sv.to(tl.float32)) * w_i[:, None]
+        y = acc * tl.sigmoid(acc)
+        tl.store(Yn + offs_c[:, None] * sYc + offs_t[None, :] * sYt,
+                 y.to(Y.dtype.element_ty),
+                 mask=cm[:, None] & (offs_t < T)[None, :])
+    end = tl.load(ENDP + n)
+    if end >= 0:
+        for i in tl.static_range(K - 1):
+            p = end - (K - 1) + i
+            xv = tl.load(Xn + offs_c * sXc + p * sXt,
+                         mask=cm & (p >= 0), other=0.0)
+            sv = tl.load(Sn + offs_c * sSc + (p + (K - 1)),
+                         mask=cm & (p < 0), other=0.0)
+            tl.store(Sn + offs_c * sSc + i, (xv + sv), mask=cm)
+
+
+def causal_conv_silu(x, state, weight, endp):
+    """x [n, C, T] (arbitrary strides), state [n, C, K-1] (updated in
+    place at each row's ENDP), weight [C, K].  Returns y [n, C, T]
+    contiguous.  endp: int32 [n] (last real position per row, -1 = skip
+    writeback)."""
+    n, C, T = x.shape
+    K = weight.shape[-1]
+    y = torch.empty(n, C, T, dtype=x.dtype, device=x.device)
+    BLOCK_C = 64
+    BLOCK_T = 64
+    _causal_conv_silu_kernel[(n, triton.cdiv(C, BLOCK_C))](
+        x, state, weight, y, endp, T, C,
+        x.stride(0), x.stride(1), x.stride(2),
+        state.stride(0), state.stride(1),
+        y.stride(0), y.stride(1), y.stride(2),
+        K=K, BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C, num_warps=4,
+    )
+    return y
+
+
+@triton.jit
+def _gdn_g_beta_kernel(
+    Bp, Ap, AL, DT, MASK, Gp, BETA, total,
+    VH: tl.constexpr, HAS_MASK: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """g = -exp(A_log)·softplus(a + dt_bias) (fp32, zero on padding),
+    beta = sigmoid(b) (bf16) — one kernel for the whole [n, T, Vh] batch
+    (was ~7 eager elementwise kernels per layer)."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < total
+    h = offs % VH
+    a = tl.load(Ap + offs, mask=m, other=0.0).to(tl.float32)
+    b = tl.load(Bp + offs, mask=m, other=0.0).to(tl.float32)
+    al = tl.load(AL + h, mask=m, other=0.0).to(tl.float32)
+    dt = tl.load(DT + h, mask=m, other=0.0).to(tl.float32)
+    z = a + dt
+    sp = tl.where(z > 20.0, z, tl.log(1.0 + tl.exp(z)))
+    g = -tl.exp(al) * sp
+    if HAS_MASK:
+        real = tl.load(MASK + offs // VH, mask=m, other=0)
+        g = tl.where(real, g, 0.0)
+    tl.store(Gp + offs, g, mask=m)
+    tl.store(BETA + offs, tl.sigmoid(b).to(BETA.dtype.element_ty), mask=m)
+
+
+def fused_g_beta(b, a, a_log, dt_bias, mask):
+    """b/a [.., Vh] bf16 contiguous; a_log/dt_bias [Vh]; mask [n, T] bool
+    or None (padding rows get g = 0).  Returns (g fp32, beta bf16)."""
+    total = a.numel()
+    vh = a.shape[-1]
+    g = torch.empty_like(a, dtype=torch.float32)
+    beta = torch.empty_like(a)
+    flat_mask = (mask.reshape(-1).contiguous() if mask is not None
+                 else b)  # dummy pointer when unused
+    BLOCK = 256
+    _gdn_g_beta_kernel[(triton.cdiv(total, BLOCK),)](
+        b, a, a_log, dt_bias, flat_mask,
+        g, beta, total, VH=vh, HAS_MASK=mask is not None,
+        BLOCK=BLOCK, num_warps=4,
+    )
+    return g, beta
+
+
+# A/B switch for the fused g/beta kernel (NANOVLLM_GDN_GBETA=0 restores
+# the eager fp32 elementwise chain).
+_USE_GDN_GBETA = _os.environ.get("NANOVLLM_GDN_GBETA", "1") == "1"
+
+
+@triton.jit
+def _causal_conv_silu_varlen_kernel(
+    X, S, W, Y, LENS, CUSEQ, C, sXn, sSn, sSc,
+    K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
+):
+    """Varlen depthwise causal conv + SiLU over flat x [N, C] rows.
+
+    Program (row r of n_seqs, channel block) processes that sequence's
+    [0, T_r) tokens at flat offset CUSEQ[r] — projections stay dense
+    varlen GEMMs and nothing is padded.  The conv window never crosses a
+    sequence boundary (p ∈ [0, T_r) by construction), and the state is
+    rolled in place at the row's end (= T_r, all rows real).
+    """
+    r = tl.program_id(0)
+    pc = tl.program_id(1)
+    offs_c = pc * BLOCK_C + tl.arange(0, BLOCK_C)
+    cm = offs_c < C
+    T = tl.load(LENS + r)
+    base = tl.load(CUSEQ + r) * sXn
+    Xr = X + base
+    Sn = S + r * sSn
+    Yr = Y + base
+    for t0 in range(0, T, BLOCK_T):
+        offs_t = t0 + tl.arange(0, BLOCK_T)
+        acc = tl.zeros((BLOCK_C, BLOCK_T), dtype=tl.float32)
+        for i in tl.static_range(K):
+            p = offs_t - (K - 1) + i
+            xv = tl.load(Xr + offs_c[:, None] + p[None, :] * sXn,
+                         mask=cm[:, None] & (p >= 0)[None, :] & (p < T)[None, :],
+                         other=0.0)
+            sv = tl.load(Sn + offs_c[:, None] * sSc + (p + (K - 1))[None, :],
+                         mask=cm[:, None] & (p < 0)[None, :],
+                         other=0.0)
+            w_i = tl.load(W + offs_c * K + i, mask=cm, other=0.0).to(tl.float32)
+            acc += (xv.to(tl.float32) + sv.to(tl.float32)) * w_i[:, None]
+        y = acc * tl.sigmoid(acc)
+        tl.store(Yr + offs_c[:, None] + offs_t[None, :] * sXn,
+                 y.to(Y.dtype.element_ty),
+                 mask=cm[:, None] & (offs_t < T)[None, :])
+    for i in tl.static_range(K - 1):
+        p = T - (K - 1) + i
+        xv = tl.load(Xr + offs_c + p * sXn,
+                     mask=cm & (p >= 0) & (p < T), other=0.0)
+        sv = tl.load(Sn + offs_c * sSc + (p + (K - 1)),
+                     mask=cm & (p < 0), other=0.0)
+        tl.store(Sn + offs_c * sSc + i, (xv + sv), mask=cm)
+
+
+def causal_conv_silu_varlen(x, state, weight, lens, cuseq):
+    """x [N, C] bf16 contiguous varlen; state [n, C, K-1] (updated in
+    place); lens int32 [n] GPU; cuseq int32 [n] GPU (per-row starts)."""
+    N, C = x.shape
+    K = weight.shape[-1]
+    y = torch.empty(N, C, dtype=x.dtype, device=x.device)
+    _causal_conv_silu_varlen_kernel[(lens.shape[0], triton.cdiv(C, 64))](
+        x, state, weight, y, lens, cuseq, C,
+        x.stride(0), state.stride(0), state.stride(1),
+        K=K, BLOCK_T=64, BLOCK_C=64, num_warps=4,
+    )
+    return y
+
+
+# A/B switch for the varlen prefill path (NANOVLLM_GDN_VARLEN=0 restores
+# the padded [n, max_T] chunk path; requires fla).
+_USE_GDN_VARLEN = (_USE_FLA_CHUNK
+                   and _os.environ.get("NANOVLLM_GDN_VARLEN", "1") == "1")
+
+# Per-step varlen metadata (cu/lens GPU tensors + pinned host copies),
+# shared by every GDN layer: built once per new length-tuple, reused by
+# the other 17 layers of the same step (building pinned tensors per
+# layer swamped small mixed-batch steps in ~200µs×18 of pinned-allocator
+# churn).
+_VARLEN_META: tuple | None = None
+
+
+def _varlen_meta(lens_q: list[int]):
+    global _VARLEN_META
+    key = tuple(lens_q)
+    if _VARLEN_META is not None and _VARLEN_META[0] == key:
+        return _VARLEN_META[1]
+    cu = [0]
+    for l in lens_q:
+        cu.append(cu[-1] + l)
+    cu_cpu = torch.tensor(cu, dtype=torch.int32, pin_memory=True)
+    lens_cpu = torch.tensor(lens_q, dtype=torch.int32, pin_memory=True)
+    meta = (cu_cpu.cuda(non_blocking=True), lens_cpu.cuda(non_blocking=True),
+            cu_cpu.to(torch.int64), cu_cpu.to(torch.int64).cuda(non_blocking=True))
+    _VARLEN_META = (key, meta)
+    return meta
+
+
+# A/B switch: NANOVLLM_CONV_TRITON=0 restores the F.conv1d reference path.
+# The Triton kernel only covers T > 1 (prefill/mixed chunks): at T = 1 its
+# 64-wide T tiles are 98% masked and the per-K scalar state stores add
+# ~30µs/layer — the reference cat+conv1d there is 3 tiny kernels.
+_USE_CONV_TRITON = _os.environ.get("NANOVLLM_CONV_TRITON", "1") == "1"
+
+
+@triton.jit
 def _recurrent_inplace_kernel(
     Q, K, V, G, B, S_POOL, IDS, OUT, scale,
     q_bstride, k_bstride, v_bstride, slot_stride,
@@ -338,9 +569,20 @@ class Qwen3_5RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
 
     def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _USE_FI_NORM:
+            return _fi_norm.gemma_rmsnorm(x, self.weight, eps=self.eps)
         return _gemma_rms_forward(x, self.weight, self.eps)
 
     def add_rms_forward(self, x: torch.Tensor, residual: torch.Tensor):
+        if _USE_FI_NORM:
+            # In-place: x becomes the normed output, residual becomes
+            # x + residual.  The decoder layer rebinds both immediately
+            # and drops the originals, so the mutation is safe — and it
+            # is exactly the buffer-reuse pattern the kernel is built
+            # for (works unchanged under CUDA graphs).
+            _fi_norm.gemma_fused_add_rmsnorm(x, residual, self.weight,
+                                             eps=self.eps)
+            return x, residual
         return _gemma_add_rms_forward(x, residual, self.weight, self.eps)
 
     def forward(self, x, residual=None):
@@ -527,37 +769,131 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         T = int(context.max_seqlen_q)
         H = self.hidden_size
 
-        # varlen [N, H] -> padded [bs, T, H]; mask keeps the row order so the
-        # output can be gathered back with the same mask.
         if T == 1:
-            x = hidden_states.view(bs, 1, H)
-            mask = None
-        else:
-            mask = torch.arange(T, device=hidden_states.device) < lens.unsqueeze(1)
-            x = hidden_states.new_zeros(bs, T, H)
-            x[mask] = hidden_states
+            return self._gdn_padded(
+                hidden_states.view(bs, 1, H), lens, ids, 1).view(-1, H)
 
-        b = self.in_proj_b(x)                             # [bs, T, H]
-        a = self.in_proj_a(x)                             # [bs, T, H]
-        beta = b.sigmoid()
+        lens_q = context.lens_q if context.lens_q is not None else lens.tolist()
+        # Mixed batches (continuous scheduling emits decode rows before
+        # prefill chunks): route the decode prefix through the T=1
+        # recurrent path and only the prefill rows through the chunk path
+        # at their own max length.  A single padded [bs, T=max_seqlen_q]
+        # chunk pass over a mostly-decode batch computes up to ~150x the
+        # real token count (the #1 loss vs vLLM on ragged workloads).
+        n1 = 0
+        while n1 < bs and lens_q[n1] == 1:
+            n1 += 1
+        pre_ok = n1 > 0 and n1 < bs and min(lens_q[n1:]) > 1
+        if n1 == 0 or pre_ok:
+            off = 0
+            parts = []
+            if n1:
+                parts.append(self._gdn_padded(
+                    hidden_states[:n1].view(n1, 1, H),
+                    lens[:n1], ids[:n1], 1).view(-1, H))
+                off = n1
+            if _USE_GDN_VARLEN:
+                # True varlen prefill group: dense [N, H] projections, no
+                # padding anywhere (the fla chunk kernel natively takes
+                # cu_seqlens; verified bit-equivalent to the padded call).
+                parts.append(self._gdn_prefill_varlen(
+                    hidden_states[off:], lens_q[off:], ids[off:]))
+                return torch.cat(parts, dim=0)
+            lens_p = lens[off:]
+            Tp = T if off == 0 else max(lens_q[off:])
+            mask_p = torch.arange(
+                Tp, device=hidden_states.device) < lens_p.unsqueeze(1)
+            x = hidden_states.new_zeros(bs - off, Tp, H)
+            x[mask_p] = hidden_states[off:]
+            parts.append(self._gdn_padded(x, lens_p, ids[off:], Tp)[mask_p])
+            return torch.cat(parts, dim=0)
+        # Defensive: len-1 rows are not a contiguous prefix (no scheduler
+        # produces this today) — one padded pass over everything.
+        mask = torch.arange(T, device=hidden_states.device) < lens.unsqueeze(1)
+        x = hidden_states.new_zeros(bs, T, H)
+        x[mask] = hidden_states
+        return self._gdn_padded(x, lens, ids, T)[mask]
+
+    def _gdn_prefill_varlen(self, hidden, lens_q, ids) -> torch.Tensor:
+        """Prefill group in true varlen (requires fla): dense [N, H]
+        projections over the flat token axis, a varlen causal-conv kernel,
+        and the fla chunk kernel driven by cu_seqlens — no padding at any
+        stage, so ragged prompt groups cost exactly their real tokens.
+        Returns the varlen output [N, H]."""
+        n = len(lens_q)
+        b = self.in_proj_b(hidden)                      # [N, Vh]
+        a = self.in_proj_a(hidden)
         A_log = self.A_log[self._v_head_slice]
         dt_bias = self.dt_bias[self._v_head_slice]
-        g = -A_log.float().exp() * F.softplus(a.float() + dt_bias.float())
-        if mask is not None:
-            # Padded rows: k/v are zero there (bias-free conv over zero
-            # input) but g is NOT (-exp(A_log)·softplus(dt_bias) < 0) —
-            # left unmasked it decays the recurrent state across the
-            # padding tail, wiping short sequences' state in a
-            # mixed-length batch.  g=0 makes trailing chunks exact no-ops
-            # (beta is irrelevant: the state update is proportional to k).
-            g = g.masked_fill(~mask.unsqueeze(-1), 0.0)
-        conv_w = self.conv1d.weight                       # [conv_dim, 1, k]
+        if _USE_GDN_GBETA:
+            g, beta = fused_g_beta(b, a, A_log, dt_bias, None)
+        else:
+            beta = b.sigmoid()
+            g = -A_log.float().exp() * F.softplus(a.float() + dt_bias.float())
+        z = self.in_proj_z(hidden)                      # [N, value_dim]
+        mixed = self.in_proj_qkv(hidden)                # [N, conv_dim]
+        cu_gpu, lens_gpu, cu64_cpu, cu64_gpu = _varlen_meta(lens_q)
+        conv_state = self.conv_cache[ids]
+        mixed = causal_conv_silu_varlen(
+            mixed, conv_state,
+            self.conv1d.weight.view(self.conv_dim, self.conv_kernel),
+            lens_gpu, cu_gpu[:-1])
+        self.conv_cache[ids] = conv_state
+        q, k, v = mixed.split([self.key_dim, self.key_dim, self.value_dim],
+                              dim=1)
+        q = q.view(-1, self.num_k_heads, self.head_k_dim)
+        k = k.view(-1, self.num_k_heads, self.head_k_dim)
+        v = v.view(-1, self.num_v_heads, self.head_v_dim)
+        if self.num_v_heads > self.num_k_heads:
+            rep = self.num_v_heads // self.num_k_heads
+            q = q.repeat_interleave(rep, dim=1)
+            k = k.repeat_interleave(rep, dim=1)
+        out, new_state = _fla_chunk(
+            q[None], k[None], v[None], g=g[None], beta=beta[None],
+            initial_state=self.s_cache[ids], output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu64_gpu, cu_seqlens_cpu=cu64_cpu)
+        self.s_cache[ids] = new_state
+        core = out[0]                                   # [N, H, DV]
+        core = self.norm(core, z.view(-1, self.num_v_heads, self.head_v_dim))
+        y = self.out_proj(core.reshape(-1, self.value_dim))
+        return y
 
-        def split_qkv(mixed, n):
+    def _gdn_padded(self, x, lens, ids, T) -> torch.Tensor:
+        """GDN over an already-padded [n, T, H] batch — padding is an exact
+        no-op there (zero qkv, g=0).  Returns the padded output [n, T, H].
+        """
+        n = x.size(0)
+        mask = None if T == 1 else (
+            torch.arange(T, device=x.device) < lens.unsqueeze(1))
+        b = self.in_proj_b(x)                             # [n, T, H]
+        a = self.in_proj_a(x)                             # [n, T, H]
+        A_log = self.A_log[self._v_head_slice]
+        dt_bias = self.dt_bias[self._v_head_slice]
+        if _USE_GDN_GBETA:
+            # Fused kernel handles the padding (g = 0 there) directly.
+            g, beta = fused_g_beta(b, a, A_log, dt_bias, mask)
+        else:
+            beta = b.sigmoid()
+            g = -A_log.float().exp() * F.softplus(a.float() + dt_bias.float())
+            if mask is not None:
+                # Padded rows: k/v are zero there (bias-free conv over zero
+                # input) but g is NOT (-exp(A_log)·softplus(dt_bias) < 0) —
+                # left unmasked it decays the recurrent state across the
+                # padding tail, wiping short sequences' state in a
+                # mixed-length batch.  g=0 makes trailing chunks exact
+                # no-ops (beta is irrelevant: the state update is
+                # proportional to k).
+                g = g.masked_fill(~mask.unsqueeze(-1), 0.0)
+        z = self.in_proj_z(x)                             # [n, T, value_dim]
+        conv_w = self.conv1d.weight                       # [conv_dim, 1, K]
+        K = self.conv_kernel
+
+        def split_qkv(mixed, m):
             q, k, v = mixed.split([self.key_dim, self.key_dim, self.value_dim], dim=1)
-            q = q.transpose(1, 2).reshape(bs, n, self.num_k_heads, self.head_k_dim)
-            k = k.transpose(1, 2).reshape(bs, n, self.num_k_heads, self.head_k_dim)
-            v = v.transpose(1, 2).reshape(bs, n, self.num_v_heads, self.head_v_dim)
+            q = q.transpose(1, 2).reshape(n, m, self.num_k_heads, self.head_k_dim)
+            k = k.transpose(1, 2).reshape(n, m, self.num_k_heads, self.head_k_dim)
+            v = v.transpose(1, 2).reshape(n, m, self.num_v_heads, self.head_v_dim)
             if self.num_v_heads > self.num_k_heads:
                 rep = self.num_v_heads // self.num_k_heads
                 q = q.repeat_interleave(rep, dim=2)
@@ -565,13 +901,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             return q, k, v
 
         if T == 1:
-            # Decode: roll the conv state and convolve the 4-token window.
-            mixed = self.in_proj_qkv(x).transpose(1, 2)   # [bs, conv_dim, 1]
+            # Decode: roll the conv state and convolve the K-token window.
+            mixed = self.in_proj_qkv(x).transpose(1, 2)   # [n, conv_dim, 1]
             window = torch.cat([self.conv_cache[ids], mixed], dim=-1)
             self.conv_cache[ids] = window[..., 1:]
             mixed = F.silu(F.conv1d(window, conv_w, groups=self.conv_dim))
             q, k, v = split_qkv(mixed, 1)
-            z = self.in_proj_z(x)
             if _USE_GDN_INPLACE:
                 # In-place pool update (no gather/scatter of the 452MB state).
                 out = recurrent_gdn_inplace(q, k, v, g, beta, self.s_cache, ids)
@@ -584,44 +919,44 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # PREFILL_SEGMENT_TOKENS).  The conv state threads across
             # segments; a zero state on the first segment of a fresh prefill
             # is identical to the causal conv's zero left-padding.
-            z = self.in_proj_z(x)                         # [bs, T, value_dim]
             seg_tokens = (self.PREFILL_SEGMENT_TOKENS_FLA if _USE_FLA_CHUNK
                           else self.PREFILL_SEGMENT_TOKENS_TORCH)
-            seg = max(1, seg_tokens // bs)
-            conv_states = self.conv_cache[ids]            # [bs, conv_dim, k-1]
+            seg = max(1, seg_tokens // n)
+            conv_states = self.conv_cache[ids]            # [n, conv_dim, K-1]
             state = self.s_cache[ids]
             outs = []
             for t0 in range(0, T, seg):
                 t1 = min(t0 + seg, T)
-                n = t1 - t0
+                m = t1 - t0
                 mixed = self.in_proj_qkv(x[:, t0:t1]).transpose(1, 2)
-                window = torch.cat([conv_states, mixed], dim=-1)
-                mixed = F.silu(F.conv1d(window, conv_w, groups=self.conv_dim))
-                seg_mask = mask[:, t0:t1] if mask is not None else None
-                if seg_mask is not None:
+                r = (lens - t0)
+                valid = r > 0               # padding-only rows keep their state
+                if _USE_CONV_TRITON:
+                    # -1 skips the writeback for padding-only rows; the
+                    # kernel rolls the state in place at each row's last
+                    # real position (min(r, m)), replacing the cat + conv
+                    # + window-gather of the reference path.
+                    endp = r.clamp(min=-1, max=m).to(torch.int32)
+                    mixed = causal_conv_silu(
+                        mixed, conv_states, conv_w.view(self.conv_dim, K), endp)
+                    self.conv_cache[ids[valid]] = conv_states[valid]
+                else:
+                    window = torch.cat([conv_states, mixed], dim=-1)
+                    mixed = F.silu(F.conv1d(window, conv_w, groups=self.conv_dim))
+                    starts = r.clamp(min=0, max=m)
+                    cols = starts.view(n, 1, 1) + torch.arange(
+                        K - 1, device=window.device, dtype=torch.int64)
+                    sel = window.gather(-1, cols.expand(n, window.size(1), K - 1))
+                    self.conv_cache[ids[valid]] = sel[valid]
+                    conv_states = window[..., -(K - 1):]
+                if mask is not None:
+                    seg_mask = mask[:, t0:t1]
                     # Padded rows' conv output would see the real history
                     # through the sliding window (non-zero k/v) and pollute
                     # the recurrent state — zero them so padding is an
                     # exact no-op.
                     mixed = mixed * seg_mask.unsqueeze(1).to(mixed.dtype)
-                # Per-seq conv-state writeback at the latest real position:
-                # window layout is [state(k-1), x(n)], token t0+i sits at
-                # column k-1+i, so the 3-wide state after a seq's last real
-                # token in this segment starts at column min(r, n) (r =
-                # remaining real tokens).  Batched gather replaces the old
-                # per-seq loop (one GPU sync per row via int(lens[b_i])).
-                if seg_mask is not None:
-                    r = (lens - t0)
-                    starts = r.clamp(min=0, max=n)        # [bs]
-                    valid = r > 0                          # padding-only seqs keep their state
-                    cols = starts.view(bs, 1, 1) + torch.arange(
-                        3, device=window.device, dtype=torch.int64)
-                    sel = window.gather(-1, cols.expand(bs, window.size(1), 3))
-                    self.conv_cache[ids[valid]] = sel[valid]
-                else:
-                    self.conv_cache[ids] = window[..., -3:]
-                conv_states = window[..., -3:]
-                q, k, v = split_qkv(mixed, n)
+                q, k, v = split_qkv(mixed, m)
                 out_i, state = chunk_gated_delta_rule(
                     q, k, v, g[:, t0:t1], beta[:, t0:t1], initial_state=state)
                 outs.append(out_i)
@@ -631,11 +966,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Norm on the value head dim: keep the head dim explicit (weight is
         # [head_v_dim], shared across heads — matches the reference's
         # reshape(-1, head_v_dim) 2D norm).
-        core = out.reshape(bs, T, self.num_v_heads, self.head_v_dim)
-        core = self.norm(core, z.view(bs, T, self.num_v_heads, self.head_v_dim))
-        core = core.reshape(bs, T, self.value_dim)
-        y = self.out_proj(core)                           # [bs, T, H]
-        return y.view(-1, H) if mask is None else y[mask]
+        core = out.reshape(n, T, self.num_v_heads, self.head_v_dim)
+        core = self.norm(core, z.view(n, T, self.num_v_heads, self.head_v_dim))
+        core = core.reshape(n, T, self.value_dim)
+        y = self.out_proj(core)                           # [n, T, H]
+        return y
 
 
 class Qwen3_5MLP(nn.Module):
@@ -656,7 +991,10 @@ class Qwen3_5MLP(nn.Module):
 
     def forward(self, x):
         gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if _USE_FI_NORM:
+            x = _fi_act.silu_and_mul(gate_up)
+        else:
+            x = self.act_fn(gate_up)
         x = self.down_proj(x)
         return x
 

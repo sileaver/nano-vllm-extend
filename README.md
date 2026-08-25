@@ -78,6 +78,58 @@ Speculative decoding requires `tp = pp = 1` (it can run under DP — each
 replica speculates independently).  `collect_timing` and step-level
 `add_request`/`step` streaming are single-group only.
 
+## Async Scheduling (vLLM V1 style)
+
+`async_scheduling=True` pipelines CPU scheduling under GPU execution the
+way vLLM V1's async scheduler does — sampled tokens never round-trip
+through the CPU:
+
+* **GPU token ring** — each step's sampled ids stay on the GPU (a small
+  ring of slots).  The next decode step gathers its `input_ids`
+  on-device from the previous step's slot (row map known from scheduler
+  metadata); TP/PP groups move the slot with one NCCL broadcast.
+* **Lagging output processing** — results return via an async D2H into
+  pinned memory guarded by a CUDA event.  The engine polls events at the
+  start of each iteration and applies outputs one to two steps late,
+  entirely off the critical path.  Steady-state decode never blocks the
+  CPU on the GPU (pipeline depth capped at 2).
+* **Optimistic scheduling** — KV slots for in-flight tokens are reserved
+  via output placeholders (vLLM's "future token ids"), and a sequence
+  that hits EOS runs one extra wasted row before the CPU notices; its
+  blocks/state are released when the last step referencing it completes.
+* **Synchronous fallback** — prefill-containing batches (and preemption,
+  which accompanies them) drain the pipeline and run synchronously, so
+  chunk accounting always sees a caught-up scheduler.
+
+Measured on RTX 5090 (decode-bound load): Qwen3-0.6B @ bs=64
+20.1k → 22.6k tok/s (+11.6%), Qwen3.5-2B @ bs=64 10.2k → 11.1k tok/s,
+and the gain grows with parallelism (more CPU + NCCL launch overhead to
+hide): Qwen3-0.6B @ tp2 11.9k → 19.0k tok/s (+59%), Qwen3.5-2B @ tp2
+10.1k → 11.4k tok/s (+11.7%).  After this, decode is GPU-bound: the
+remaining per-step time is the CUDA graph replay plus the memory-bound
+lm-head GEMM.
+
+The hybrid-model (Qwen3.5) optimizations bring nano-vllm to parity with
+vLLM 0.27 on ragged serving workloads (mixed 9.5k → 22.4k tok/s vs
+23.3k, prefill 33.6k → 62.8k vs 62.5k, decode within 3-5%):
+
+* **Varlen GDN** — the gated-delta-net layer used to pad batches to
+  `[bs, max_query_len]`, wasting up to ~150× compute on mixed
+  decode+prefill steps.  Decode rows take the O(1) recurrent path;
+  prefill groups run fully varlen (dense `[N, H]` projections, a varlen
+  causal-conv Triton kernel, and the fla chunk kernel driven by
+  `cu_seqlens` — verified bit-equivalent to the padded call).
+* **Fused GDN plumbing** — a fused g/beta kernel replaces the eager
+  fp32 elementwise chain; the Gemma-style norms and MLP activation run
+  on FlashInfer's fused kernels (`gemma_rmsnorm` /
+  `gemma_fused_add_rmsnorm` / `silu_and_mul`); the decode CUDA graphs
+  capture lm_head + a two-stage fused gumbel-max sampling kernel.
+* **Unified async scheduling** — every scheduled row (prefill chunks
+  included) reserves output placeholders, so prefill batches flow
+  through the same non-draining pipeline as decode: chunk continuation,
+  decode-on-top-of-unreaped-prefill and mixed-batch input gathering all
+  fall out of one `num_computed_tokens` invariant.
+
 ## Speculative Decoding
 
 Two modes, both gated by `num_spec_tokens=K` and verified by strict

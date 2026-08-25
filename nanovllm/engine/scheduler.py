@@ -155,7 +155,10 @@ class Scheduler:
                     self.draft_block_manager.allocate(seq, 0)
                     seq.num_cached_tokens = num_cached_blocks * self.block_size
             else:
-                num_tokens = seq.num_tokens - seq.num_cached_tokens
+                # num_computed (placeholder-inclusive) covers chunks that
+                # are still in flight under async scheduling, so a
+                # continuation chunk never re-executes its predecessor.
+                num_tokens = seq.num_tokens - seq.num_computed_tokens
 
             # Allow chunked prefill for *any* sequence in the continuous
             # path (not just the first).  This is what lets new short
@@ -166,7 +169,7 @@ class Scheduler:
             num_batched_tokens += chunk
             scheduled_seqs.append(seq)
 
-            if seq.num_cached_tokens + chunk == seq.num_tokens:
+            if seq.num_computed_tokens + chunk == seq.num_tokens:
                 # Full prompt consumed → promote to running.
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
@@ -233,7 +236,14 @@ class Scheduler:
                 seq.is_prefill = False
                 self._ensure_append_all(seq, ntok)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
+        if not scheduled_seqs:
+            # Fully drained mid-step: with async scheduling every running
+            # sequence can finish in steps reaped at the top of _step_async
+            # (after the engine's is_finished() check), leaving both queues
+            # empty here.  Also covers a starved prefill loop (waiting head
+            # cannot allocate).  Return an empty schedule — the engine
+            # treats it as a no-op step.
+            return scheduled_seqs, 0, False
         # Round-robin: re-queue at the TAIL.  extendleft(reversed(...)) puts
         # the scheduled batch back at the head, so whenever running exceeds
         # max_num_seqs the queue tail is never scheduled (starvation → the

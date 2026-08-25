@@ -11,7 +11,7 @@ from nanovllm.engine.gpu_state import GpuStateTable
 from nanovllm.engine.gpu_prepare import gather_batch_inputs
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM
-from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.sampler import Sampler, gumbel_argmax
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.flashinfer_env import setup_flashinfer_env
 from nanovllm.utils.loader import load_model
@@ -266,7 +266,8 @@ class ModelRunner:
         conv_dim, conv_states = m0.conv_dim, m0.conv_kernel - 1
         per_slot = L * (H * K * V * 4 + conv_dim * conv_states * 2)
         free, total = torch.cuda.mem_get_info()
-        budget = min(4 * 1024**3, int(total * 0.25))
+        budget = min(int(os.environ.get("NANOVLLM_STATE_GB", 6)) * 1024**3,
+                     int(total * 0.25))
         num_slots = self._min_over_group(
             min(self.config.max_num_seqs, max(8, budget // per_slot)))
         self.config.max_num_seqs = min(self.config.max_num_seqs, num_slots)
@@ -546,8 +547,9 @@ class ModelRunner:
         is_prefill = torch.tensor(
             [seq.is_prefill for seq in seqs], dtype=torch.int32, device="cuda"
         )
+        sched_tokens_list = [seq.num_scheduled_tokens for seq in seqs]
         sched_tokens = torch.tensor(
-            [seq.num_scheduled_tokens for seq in seqs], dtype=torch.int32, device="cuda"
+            sched_tokens_list, dtype=torch.int32, device="cuda"
         )
 
         # ── Launch Triton gather kernel ─────────────────────────
@@ -581,7 +583,8 @@ class ModelRunner:
         linear_state_ids = self._linear_state_context(seqs)
         set_context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                     slot_mapping, block_tables, num_decode, fi_decode, fi_prefill,
-                    linear_state_ids=linear_state_ids)
+                    linear_state_ids=linear_state_ids,
+                    lens_q=sched_tokens_list)
         return input_ids, positions, is_uniform_decode
 
     def _prepare_batch_cpu(self, seqs: list[Sequence]):
@@ -594,6 +597,7 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        lens_q = []
 
         for seq in seqs:
             if seq.is_prefill:
@@ -613,6 +617,7 @@ class ModelRunner:
                 input_ids.append(seq.last_token)
                 positions.append(seq.num_cached_tokens)
 
+            lens_q.append(seqlen_q)
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
@@ -643,7 +648,7 @@ class ModelRunner:
         linear_state_ids = self._linear_state_context(seqs)
         set_context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                     slot_mapping, block_tables, num_decode, fi_decode, fi_prefill,
-                    linear_state_ids=linear_state_ids)
+                    linear_state_ids=linear_state_ids, lens_q=lens_q)
         return input_ids, positions, is_uniform_decode
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -673,6 +678,7 @@ class ModelRunner:
         use_graph = (is_uniform_decode and not self.enforce_eager
                      and input_ids.size(0) <= 512
                      and context.block_tables is not None)
+        self._graph_sampled_buf = None
         if not use_graph:
             hidden_states = residual = None
             if self.pp_rank > 0:
@@ -705,6 +711,13 @@ class ModelRunner:
         graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
         if "linear_state_ids" in graph_vars:
             graph_vars["linear_state_ids"][:bs] = context.linear_state_ids
+        if self._graph_sampling and self.rank == self.sampler_rank:
+            # Inputs for the in-graph sampler (stream-ordered before the
+            # replay): temperatures + a fresh philox seed per step.
+            graph_vars["gtemps"][:bs] = self._async_sample_params[0][:bs]
+            self._gseed_ctr += 1
+            self._gseed_pinned[0] = self._gseed_ctr
+            graph_vars["gseed"].copy_(self._gseed_pinned, non_blocking=True)
         if self.pp_rank > 0:
             dist.recv(graph_vars["hidden_in"][:bs], src=self.pp_peer_prev)
             dist.recv(graph_vars["residual_in"][:bs], src=self.pp_peer_prev)
@@ -712,6 +725,11 @@ class ModelRunner:
         if not self.is_last_stage:
             dist.send(graph_vars["outputs"][:bs], dst=self.pp_peer_next)
             dist.send(graph_vars["residual_out"][:bs], dst=self.pp_peer_next)
+            return None
+        if self._graph_sampling:
+            # Sampling already happened inside the graph — expose the
+            # token buffer; callers must not touch logits (None).
+            self._graph_sampled_buf = graph_vars["gsampled"]
             return None
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -723,7 +741,9 @@ class ModelRunner:
         """Sample on the (last stage, tp 0) rank; with PP, broadcast the
         tokens so group rank 0 — the driver-side runner feeding the
         scheduler — gets them too."""
-        if self.rank == self.sampler_rank:
+        if self._graph_sampled_buf is not None:
+            tokens = self._graph_sampled_buf[:bs]   # sampled inside the graph
+        elif self.rank == self.sampler_rank:
             tokens = self.sampler(logits, *sample_params)
         else:
             tokens = torch.empty(bs, dtype=torch.int64, device="cuda")
@@ -740,6 +760,11 @@ class ModelRunner:
             return None
         input_ids, positions, is_uniform = self.prepare_batch(seqs)
         sample_params = self.prepare_sample(seqs) if self.rank == self.sampler_rank else None
+        # run_model's graph path reads the temperatures from this stash
+        # (same contract as prepare_step/prepare_step_async) for the
+        # in-graph sampler.
+        self._async_sample_params = sample_params
+        self._async_bs = len(seqs)
         logits = self.run_model(input_ids, positions, is_uniform)
         if self.draft_model is not None and any(s.is_prefill and s.block_table for s in seqs):
             if self.use_dflash_draft:
@@ -1095,6 +1120,9 @@ class ModelRunner:
     _async_sample_params: tuple | torch.Tensor | None = None
     _async_logits: torch.Tensor | None = None
     _async_bs: int = 0    # sequences in the batch (rows the sampler emits)
+    # In-graph sampling state (set by capture_cudagraph; see sample_stage).
+    _graph_sampling = False
+    _graph_sampled_buf: torch.Tensor | None = None
 
     def prepare_step(self, seqs: list[Sequence]):
         """Phase 1 (synchronous batches): prepare from CPU token state."""
@@ -1168,10 +1196,86 @@ class ModelRunner:
         linear_state_ids = self._linear_state_context(seqs)
         set_context(cu_seqlens_q, cu_seqlens_k, 1, max(computed),
                     slot_mapping, block_tables, bs, None, None,
-                    linear_state_ids=linear_state_ids)
+                    linear_state_ids=linear_state_ids, lens_q=[1] * bs)
         self._async_input_ids = input_ids
         self._async_positions = positions
         self._async_is_uniform = True
+        self._async_seqs = seqs
+        self._async_bs = bs
+        self._async_sample_params = (
+            self.prepare_sample(seqs) if self.rank == self.sampler_rank else None)
+
+    def prepare_mixed_async(self, seqs: list[Sequence], src_ring_idx: int,
+                            prev_rows: list[int], n1: int):
+        """Mixed batch (decode prefix + prefill chunks) without draining.
+
+        The first ``n1`` rows are decode rows: their input ids are
+        gathered on device from the source step's ring slot and their
+        position/slot use ``num_computed - 1`` (placeholder-inclusive, so
+        any lag is transparent).  The remaining rows are prefill chunks
+        starting at ``num_computed - num_scheduled`` (their own launch
+        position, covering unreaped predecessor chunks), with prompt
+        tokens from the CPU.  No GPU synchronisation anywhere.
+        """
+        bs = len(seqs)
+        blk = self.block_size
+        positions = []
+        slot_mapping = []
+        cu_q = [0]
+        cu_k = [0]
+        max_q = 0
+        max_k = 0
+        for i, seq in enumerate(seqs):
+            if i < n1:
+                c = seq.num_computed_tokens
+                positions.append(c - 1)
+                slot_mapping.append(
+                    seq.block_table[(c - 1) // blk] * blk + (c - 1) % blk)
+                lens, seqlen_k = 1, c
+            else:
+                chunk = seq.num_scheduled_tokens
+                start = seq.num_computed_tokens - chunk
+                positions.extend(range(start, start + chunk))
+                for j in range(chunk):
+                    pos = start + j
+                    slot_mapping.append(
+                        seq.block_table[pos // blk] * blk + pos % blk)
+                lens, seqlen_k = chunk, start + chunk
+            cu_q.append(cu_q[-1] + lens)
+            cu_k.append(cu_k[-1] + seqlen_k)
+            max_q = max(max_q, lens)
+            max_k = max(max_k, seqlen_k)
+        rows = torch.tensor(prev_rows, dtype=torch.int64,
+                            pin_memory=True).cuda(non_blocking=True)
+        dec_ids = self._sampled_ring[src_ring_idx][rows]
+        pre_len = bs - n1
+        pre_ids = []
+        for seq in seqs[n1:]:
+            start = seq.num_computed_tokens - seq.num_scheduled_tokens
+            pre_ids.extend(seq[start:start + seq.num_scheduled_tokens])
+        if pre_len:
+            pre = torch.tensor(pre_ids, dtype=torch.int64,
+                               pin_memory=True).cuda(non_blocking=True)
+            input_ids = torch.cat([dec_ids, pre]) if n1 else pre
+        else:
+            input_ids = dec_ids
+        positions = torch.tensor(positions, dtype=torch.int64,
+                                 pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32,
+                                    pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_q, dtype=torch.int32,
+                                    pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_k, dtype=torch.int32,
+                                    pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        linear_state_ids = self._linear_state_context(seqs)
+        set_context(cu_seqlens_q, cu_seqlens_k, max_q, max_k,
+                    slot_mapping, block_tables, n1, None, None,
+                    linear_state_ids=linear_state_ids,
+                    lens_q=[cu_q[i + 1] - cu_q[i] for i in range(bs)])
+        self._async_input_ids = input_ids
+        self._async_positions = positions
+        self._async_is_uniform = False
         self._async_seqs = seqs
         self._async_bs = bs
         self._async_sample_params = (
@@ -1189,8 +1293,11 @@ class ModelRunner:
         bs = self._async_bs
         slot = self._sampled_ring[ring_idx]
         if self.rank == self.sampler_rank:
-            tokens = self.sampler(self._async_logits, *self._async_sample_params)
-            slot[:bs] = tokens
+            if self._graph_sampled_buf is not None:
+                slot[:bs] = self._graph_sampled_buf[:bs]   # sampled in-graph
+            else:
+                tokens = self.sampler(self._async_logits, *self._async_sample_params)
+                slot[:bs] = tokens
         if self.world_size > 1:
             dist.broadcast(slot, src=self.sampler_rank)
         if self.rank == 0:
@@ -1248,6 +1355,32 @@ class ModelRunner:
         # flags are True there and the buffers stay identical to before.)
         pp_first = is_first_pp_stage()
         pp_last = is_last_pp_stage()
+        # In-graph logits + sampling (torch backend only): the last stage's
+        # graphs extend past the model to lm_head + a fused gumbel-max
+        # kernel, writing token ids straight into a graph buffer.  Removes
+        # the per-step eager launch of compute_logits + sampler and the
+        # [bs, V] fp32 materialisation; the sampling kernel reads the bf16
+        # logits once and draws philox noise seeded from a GPU counter the
+        # driver bumps each step (fresh randomness per replay).
+        graph_sampling = (not is_draft and pp_last
+                          and self.sampling_backend == "torch"
+                          and self.num_spec_tokens == 0
+                          and model.lm_head is not None
+                          and os.environ.get("NANOVLLM_GRAPH_SAMPLE", "1") == "1")
+        if not is_draft:
+            self._graph_sampling = graph_sampling
+            self._graph_sampled_buf = None
+            self._gseed_ctr = 0
+            self._gseed_pinned = torch.zeros(1, dtype=torch.int32,
+                                             device="cpu", pin_memory=True)
+        gtemps = gsampled = gseed = gpmax = gpidx = None
+        if graph_sampling:
+            gtemps = torch.ones(max_bs, dtype=torch.float32)
+            gsampled = torch.zeros(max_bs, dtype=torch.int64)
+            gseed = torch.zeros(1, dtype=torch.int32)
+            nb = (hf_config.vocab_size + 2047) // 2048
+            gpmax = torch.empty(max_bs, nb, dtype=torch.float32)
+            gpidx = torch.empty(max_bs, nb, dtype=torch.int32)
         hidden_in = residual_in = residual_out = None
         if not pp_first:
             hidden_in = torch.zeros(max_bs, hf_config.hidden_size)
@@ -1289,6 +1422,14 @@ class ModelRunner:
             else:
                 outputs[:bs] = out
 
+        def sample_stage(bs: int):
+            if not graph_sampling:
+                return
+            logits = model.lm_head._logits(outputs[:bs])
+            if self.rank != self.sampler_rank:
+                return      # tp>0 of the last stage: gather participation only
+            gumbel_argmax(logits, gtemps, gsampled, gseed, gpmax, gpidx)
+
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             cu_seqlens_q[:bs + 1] = torch.arange(bs + 1, dtype=torch.int32)
@@ -1308,8 +1449,10 @@ class ModelRunner:
                             linear_state_ids=(linear_state_ids[:bs]
                                               if linear_state_ids is not None else None))
             store_outputs(stage_forward(bs), bs)  # warmup
+            sample_stage(bs)
             with torch.cuda.graph(graph, self.graph_pool):
                 store_outputs(stage_forward(bs), bs)  # capture
+                sample_stage(bs)
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             graphs[bs] = graph
@@ -1332,4 +1475,10 @@ class ModelRunner:
             graph_vars["residual_out"] = residual_out
         if linear_state_ids is not None:
             graph_vars["linear_state_ids"] = linear_state_ids
+        if graph_sampling:
+            graph_vars["gtemps"] = gtemps
+            graph_vars["gsampled"] = gsampled
+            graph_vars["gseed"] = gseed
+            graph_vars["gpmax"] = gpmax
+            graph_vars["gpidx"] = gpidx
         return graphs, graph_vars

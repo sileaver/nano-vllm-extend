@@ -24,6 +24,11 @@ class Context:
     # Hybrid models (linear attention layers): per-seq recurrent-state slot
     # ids into the GatedDeltaNet state pools ([bs] int64).
     linear_state_ids: torch.Tensor | None = None
+    # CPU-side per-seq query lengths (same values cu_seqlens_q encodes) —
+    # lets the GDN layer split mixed decode/prefill batches without a
+    # GPU→CPU sync.  None when the caller didn't provide them (falls back
+    # to a .tolist() on the tensor).
+    lens_q: list[int] | None = None
 
 
 _CONTEXT = Context()
@@ -37,13 +42,13 @@ def set_context(cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen
                 slot_mapping=None, block_tables=None, num_decode_tokens=0,
                 flashinfer_decode=None, flashinfer_prefill=None,
                 draft_slot_mapping=None, draft_block_tables=None,
-                linear_state_ids=None):
+                linear_state_ids=None, lens_q=None):
     global _CONTEXT
     _CONTEXT = Context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                        slot_mapping, block_tables, num_decode_tokens,
                        flashinfer_decode, flashinfer_prefill,
                        draft_slot_mapping, draft_block_tables,
-                       linear_state_ids)
+                       linear_state_ids, lens_q)
 
 
 def reset_context():

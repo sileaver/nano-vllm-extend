@@ -21,6 +21,10 @@ class _InflightStep:
     processed on the CPU (reaped when its CUDA event fires)."""
     ring_idx: int
     seqs: list[Sequence]
+    # Launch-time snapshots: a later schedule may overwrite
+    # seq.num_scheduled_tokens / seq.is_prefill before this step reaps.
+    sched_counts: list[int] = field(default_factory=list)
+    pf_flags: list[bool] = field(default_factory=list)
     # seq_id -> row in this step's batch: the gather source map for the
     # next step's on-device input assembly.
     row_of: dict[int, int] = field(default_factory=dict)
@@ -244,31 +248,34 @@ class LLMEngine:
             return finished_all, output.num_scheduled_tokens
 
         if output.is_prefill:
-            # Prefill chunks run fully synchronously (vLLM does the same):
-            # their prompt tokens live on the CPU, chunk accounting needs a
-            # caught-up scheduler, and preemption may shuffle blocks — so
-            # drain the pipeline, execute, and process outputs before the
-            # next schedule.  Only pure-decode steps enter the async
-            # pipeline, which keeps the invariant that every un-reaped
-            # scheduled token of a seq is exactly one placeholder.
-            self._drain_inflight(finished_all)
+            # Prefill batches now enter the async pipeline too (no drain):
+            # unified placeholder accounting keeps num_computed_tokens
+            # exact under lag, so chunk continuation and decode rows
+            # sharing the batch are both correct.  Prompt tokens come from
+            # the CPU, decode-prefix rows gather theirs from the previous
+            # step's ring slot.
             seqs = [s for s in seqs if not s.is_finished]
             if not seqs:
                 return finished_all, output.num_scheduled_tokens
-            # Single-command execution ("run" = prepare+execute+sample):
-            # the split three-command form (prepare_step / execute_model /
-            # sample) deadlocks under pipeline parallelism — with the
-            # sample's PP broadcast issued as its own shm command, the
-            # driver's tolist() wait never resolves (pre-existing; HEAD
-            # hangs the same way).  Prefill steps are synchronous anyway,
-            # so one command is both correct and cheaper.
-            token_ids = mr.call("run", seqs)
-            finished = self.scheduler.update_from_output(
-                seqs, token_ids, output.is_prefill)
-            finished_all.extend(
-                (s.seq_id, s.completion_token_ids) for s in finished)
-            self._release(finished)
-            return finished_all, output.num_scheduled_tokens
+            n1 = 0
+            for s in seqs:
+                if s.is_prefill:
+                    break
+                n1 += 1
+            if self._inflight:
+                src = self._inflight[-1]
+                if all(s.seq_id in src.row_of for s in seqs[:n1]):
+                    prev_rows = [src.row_of[s.seq_id] for s in seqs[:n1]]
+                    mr.call("prepare_mixed_async", seqs, src.ring_idx,
+                            prev_rows, n1)
+                else:
+                    # A decode row missing from the source batch (budget
+                    # exclusion) — rare; fall back to a drained step.
+                    self._drain_inflight(finished_all)
+                    mr.call("prepare_step", seqs)
+            else:
+                # Pipeline empty: everything is reaped, CPU tokens exact.
+                mr.call("prepare_step", seqs)
         else:
             seqs = [s for s in seqs if not s.is_finished]
             if not seqs:
@@ -286,7 +293,7 @@ class LLMEngine:
                     self._drain_inflight(finished_all)
                     mr.call("prepare_step", seqs)
             else:
-                # First decode step after a synchronous step — tokens are
+                # First decode step after a fully-reaped state — tokens are
                 # already on the CPU, plain prepare is exact.
                 mr.call("prepare_step", seqs)
 
@@ -294,28 +301,33 @@ class LLMEngine:
         ring_idx = mr.begin_ring_slot()
         mr.call("sample_async", ring_idx)
         self._inflight.append(_InflightStep(
-            ring_idx, seqs, {s.seq_id: i for i, s in enumerate(seqs)}))
+            ring_idx, seqs,
+            [s.num_scheduled_tokens for s in seqs],
+            [s.is_prefill for s in seqs],
+            {s.seq_id: i for i, s in enumerate(seqs)}))
         return finished_all, output.num_scheduled_tokens
 
     def _process_async_output(self, step: _InflightStep, tokens: list[int],
                               finished_all: list):
-        """Apply a reaped step's tokens; defer releases of sequences that
-        newer in-flight steps still reference (the wasted extra row)."""
-        finished = self.scheduler.update_from_output(step.seqs, tokens, False)
+        """Apply a reaped step's tokens (with its launch-time snapshots);
+        defer KV-block releases of sequences that newer in-flight steps
+        still reference (the wasted extra row)."""
+        finished = self.scheduler.update_from_output(
+            step.seqs, tokens, step.sched_counts, step.pf_flags)
         finished_all.extend(
             (s.seq_id, s.completion_token_ids) for s in finished)
         if finished:
+            self.model_runner.call("free_finished_gpu_rows", finished)
             if self._inflight:
                 self._inflight[-1].deferred_free.extend(finished)
             else:
-                self._release(finished)
+                self._release_blocks(finished)
         if step.deferred_free:
-            self._release(step.deferred_free)
+            self._release_blocks(step.deferred_free)
 
-    def _release(self, seqs: list[Sequence]):
+    def _release_blocks(self, seqs: list[Sequence]):
         for seq in seqs:
             self.scheduler.release(seq)
-        self.model_runner.call("free_finished_gpu_rows", seqs)
 
     def _drain_inflight(self, finished_all: list):
         """Wait for every in-flight step and process its outputs."""
