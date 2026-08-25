@@ -78,6 +78,46 @@ Speculative decoding requires `tp = pp = 1` (it can run under DP — each
 replica speculates independently).  `collect_timing` and step-level
 `add_request`/`step` streaming are single-group only.
 
+## Multimodal (Qwen3.5 vision)
+
+Qwen3.5 checkpoints ship as multimodal shells; the engine loads the full
+`Qwen3_5ForConditionalGeneration` — vision tower, MRoPE and all.  Image
+prompts follow the same dict form vLLM uses (one
+`<|vision_start|><|image_pad|><|vision_end|>` placeholder per image in
+the text; the checkpoint's own processor expands it to the image's grid
+tokens):
+
+```python
+prompts = [
+    {"prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+               "Describe this image.<|im_end|>\n<|im_start|>assistant\n",
+     "images": ["path/or/PIL.Image"]},
+    "plain text prompts work on the same engine",
+]
+outputs = llm.generate(prompts, sampling_params)
+```
+
+Under the hood (`example_qwen35_mm.py`, `tests/mm_check_qwen35.py`):
+
+* The **vision tower** (Qwen3-VL style ViT: Conv3d patch embed, learned
+  position table bilinearly resampled per image grid, per-frame
+  non-causal flash attention under 2D rope, 2x2 patch merger) is ported
+  in `nanovllm/models/qwen3_5_vision.py` — bit-exact against the
+  transformers reference at every stage in fp32
+  (`tests/mm_vision_parity_qwen35.py`).  It is replicated across TP
+  ranks and lives on the first pipeline stage; merged patch embeddings
+  replace `image_token_id` rows after the (all-reduced) token embedding,
+  one vision-tower forward per sequence however many chunks its prefill
+  splits into.
+* **Interleaved MRoPE** (`MRotaryEmbedding`) — prefill carries [3, N]
+  T/H/W positions over image regions (the port of `get_rope_index` lives
+  in `nanovllm/utils/multimodal.py`); decode collapses back to 1D via
+  the per-sequence `rope_delta`, so CUDA-graph decode replays unchanged.
+* Text-only mode: `NANOVLLM_QWEN35_TEXTONLY=1` skips the tower (the
+  previous behaviour).  Note that hash-based prefix caching is disabled
+  for hybrid (GDN) models — the recurrent state is not reconstructible
+  from cached KV blocks, so a repeated prompt must prefill from scratch.
+
 ## Async Scheduling (vLLM V1 style)
 
 `async_scheduling=True` pipelines CPU scheduling under GPU execution the

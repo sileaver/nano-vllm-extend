@@ -26,9 +26,16 @@ class Block:
 class BlockManager:
 
     def __init__(self, num_blocks: int, block_size: int,
-                 block_table_attr: str = "block_table"):
+                 block_table_attr: str = "block_table",
+                 enable_prefix_cache: bool = True):
         self.block_size = block_size
         self.block_table_attr = block_table_attr
+        # Hybrid (GDN) models pass False: their linear-attention state
+        # lives outside the KV cache, so resuming a repeated prompt from
+        # hash-matched blocks would skip the prefix's recurrent state and
+        # silently corrupt the continuation (same reason vLLM disables
+        # prefix caching for mamba-style layers).
+        self.enable_prefix_cache = enable_prefix_cache
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
@@ -58,6 +65,10 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
+        if not self.enable_prefix_cache:
+            if len(self.free_block_ids) < seq.num_blocks:
+                return -1
+            return 0
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
@@ -126,6 +137,8 @@ class BlockManager:
             table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence, num_scheduled_tokens: int | None = None):
+        if not self.enable_prefix_cache:
+            return
         if num_scheduled_tokens is None:
             num_scheduled_tokens = seq.num_scheduled_tokens
         start = seq.num_cached_tokens // self.block_size

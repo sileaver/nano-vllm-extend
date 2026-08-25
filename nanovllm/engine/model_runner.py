@@ -86,7 +86,9 @@ class ModelRunner:
             self._fi_workspace = None
 
         if "qwen3_5" in hf_config.model_type:
-            self.model = Qwen3_5ForCausalLM(hf_config)
+            self.model = Qwen3_5ForCausalLM(
+                hf_config, vision_config=config.vision_config,
+                image_token_id=config.image_token_id)
         else:
             self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
@@ -117,6 +119,14 @@ class ModelRunner:
             self.draft_model = None
         self.sampling_backend = config.sampling_backend
         self.sampler = Sampler(config.sampling_backend)
+        # ── Multimodal staging (first pipeline stage only) ──────────
+        # Per-seq GPU copies of the processor's pixel rows and the vision
+        # tower's merged embeddings (one forward per sequence, however many
+        # chunks its prefill splits into).  Freed when the prompt is fully
+        # prefilled or the sequence finishes — a preempted seq re-ships its
+        # pixels (prefill wire state) and recomputes.
+        self._vision_pixels: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._vision_embeds: dict[int, torch.Tensor] = {}
         # ── Speculative decoding (draft model, or Jacobi draft) ──
         self.num_spec_tokens = config.num_spec_tokens
         if self.num_spec_tokens > 0:
@@ -163,14 +173,18 @@ class ModelRunner:
 
         if self.world_size > 1:
             # One shm segment per replica group (keyed by the group's
-            # rendezvous port, unique per DP replica).
+            # rendezvous port, unique per DP replica).  Sized for multimodal
+            # prefill batches: one image token ships 4 patch rows of
+            # pixel_values (bf16), so a full 16k-token image batch reaches
+            # ~200MB.
             shm_name = f"nanovllm-{config.dist_port}"
+            shm_size = 256 * 2**20
             if rank == 0:
                 try:
-                    self.shm = SharedMemory(name=shm_name, create=True, size=2**20)
+                    self.shm = SharedMemory(name=shm_name, create=True, size=shm_size)
                 except FileExistsError:
                     SharedMemory(name=shm_name).unlink()  # stale crashed run
-                    self.shm = SharedMemory(name=shm_name, create=True, size=2**20)
+                    self.shm = SharedMemory(name=shm_name, create=True, size=shm_size)
                 dist.barrier()
             else:
                 dist.barrier()
@@ -272,9 +286,17 @@ class ModelRunner:
             min(self.config.max_num_seqs, max(8, budget // per_slot)))
         self.config.max_num_seqs = min(self.config.max_num_seqs, num_slots)
         self.config.num_linear_state_slots = num_slots
-        self.linear_s_pool = torch.zeros(num_slots, L, H, K, V,
+        # One extra "dummy" slot beyond the scheduler-handled range: the
+        # stale pad rows of a CUDA-graph replay (bs < captured graph size)
+        # carry capture-time linear_state_ids, and the in-place GDN
+        # recurrent/conv update would otherwise mutate whatever real slot
+        # those ids name — corrupting a live sequence's state every
+        # replayed step.  Pad rows point here instead (slot_mapping's -1
+        # guard plays the same role for the paged KV write).
+        self.linear_dummy_slot = num_slots
+        self.linear_s_pool = torch.zeros(num_slots + 1, L, H, K, V,
                                          dtype=torch.float32, device="cuda")
-        self.linear_conv_pool = torch.zeros(num_slots, L, conv_dim, conv_states,
+        self.linear_conv_pool = torch.zeros(num_slots + 1, L, conv_dim, conv_states,
                                             device="cuda")
         for layer_id, module in enumerate(gdns):
             module.s_cache = self.linear_s_pool[:, layer_id]
@@ -587,10 +609,75 @@ class ModelRunner:
                     lens_q=sched_tokens_list)
         return input_ids, positions, is_uniform_decode
 
+    # ------------------------------------------------------------------
+    # Multimodal staging: vision-tower forward once per sequence, embeddings
+    # scattered chunk by chunk as image_token_id rows enter the batch.
+    # ------------------------------------------------------------------
+
+    def _vision_embeds_for(self, seq: Sequence) -> torch.Tensor:
+        """Merged vision embeddings for *seq* (cached per seq_id)."""
+        if seq.seq_id not in self._vision_embeds:
+            visual = self.model.model.visual
+            if seq.seq_id not in self._vision_pixels:
+                pixels = seq.pixel_values.to(
+                    device="cuda", dtype=next(visual.parameters()).dtype)
+                grid = torch.tensor(seq.image_grid_thw, dtype=torch.int64,
+                                    device="cuda")
+                self._vision_pixels[seq.seq_id] = (pixels, grid)
+            pixels, grid = self._vision_pixels[seq.seq_id]
+            with torch.inference_mode():
+                self._vision_embeds[seq.seq_id] = visual(pixels, grid)
+        return self._vision_embeds[seq.seq_id]
+
+    def _stage_vision_embeds(self, seqs: list[Sequence],
+                             row_ranges: list[tuple[int, int]],
+                             chunk_ranges: list[tuple[int, int]]) -> tuple:
+        """Per-seq (row_start, row_end, embeds) triples for this batch's
+        prefill chunks: a chunk's image tokens consume their contiguous
+        prefix of the sequence's embedding rows, so chunked prefill
+        crossing an image region stays row-aligned (and a restart from a
+        prefix-cached offset re-derives its slice from token_ids — no
+        accumulated counter to corrupt across preemption)."""
+        visual = getattr(self.model.model, "visual", None)
+        if visual is None:
+            return ()
+        img_tok = self.config.image_token_id
+        entries = []
+        for seq, (r0, r1), (start, end) in zip(seqs, row_ranges, chunk_ranges):
+            if seq.pixel_values is None or r1 <= r0:
+                continue
+            n_img = seq.token_ids[start:end].count(img_tok)
+            if not n_img:
+                continue
+            embeds = self._vision_embeds_for(seq)
+            before = seq.token_ids[:start].count(img_tok)
+            entries.append((r0, r1, embeds[before:before + n_img]))
+        return tuple(entries)
+
+    def _release_vision_state(self, seq: Sequence):
+        """Drop a seq's staged pixels/embeddings once no longer needed:
+        prompt fully prefilled (decode from here on) or finished.  A
+        preempted seq re-ships pixels with its prefill state and repopulates
+        the caches on its next chunk."""
+        if seq.seq_id not in self._vision_embeds:
+            return
+        prompt_done = (not seq.is_prefill
+                       and seq.num_computed_tokens >= seq.num_prompt_tokens)
+        if seq.is_finished or prompt_done:
+            self._vision_pixels.pop(seq.seq_id, None)
+            self._vision_embeds.pop(seq.seq_id, None)
+
     def _prepare_batch_cpu(self, seqs: list[Sequence]):
         """Original CPU loop (kept for reference / fallback)."""
         input_ids = []
         positions = []
+        # MRoPE: positions become [3, N] whenever a multimodal prefill seq
+        # is in the batch; text and decode rows repeat one position across
+        # the three sections (the MRoPE module treats that identically to
+        # the 1D tensor, so decode-only batches keep today's [N] layout).
+        mrope = any(s.is_prefill and s.mrope_positions is not None
+                    for s in seqs)
+        pos_rows: list[list[int]] = [[], [], []]
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         max_seqlen_q = 0
@@ -598,24 +685,43 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         lens_q = []
+        row_ranges: list[tuple[int, int]] = []
+        chunk_ranges: list[tuple[int, int]] = []
 
         for seq in seqs:
+            row0 = len(input_ids)
             if seq.is_prefill:
                 start = seq.num_cached_tokens
                 seqlen_q = seq.num_scheduled_tokens
                 end = start + seqlen_q
                 seqlen_k = end
+                chunk_ranges.append((start, end))
                 input_ids.extend(seq[start:end])
-                positions.extend(range(start, end))
+                if seq.mrope_positions is not None:
+                    seg = seq.mrope_positions[:, start:end]
+                    for r in range(3):
+                        pos_rows[r].extend(seg[r].tolist())
+                else:
+                    positions.extend(range(start, end))
+                    if mrope:
+                        for r in range(3):
+                            pos_rows[r].extend(range(start, end))
             else:
                 seqlen_q = 1
+                chunk_ranges.append((0, 0))
                 # +1 包含 store_kvcache 刚写入的当前 token (self), 与 async
                 # 路径的 placeholder 语义 (num_computed = num_cached + 1)
                 # 保持一致; 旧代码用 num_computed 在 sync 模式下少算一个
-                # token 且 RoPE 位置落后 1。
+                # token 且 RoPE 位置落后 1。MRoPE decode 位置统一偏移
+                # rope_delta (图像区按 max(h, w) 计数, 后续文本序号回退)。
                 seqlen_k = seq.num_cached_tokens + 1
                 input_ids.append(seq.last_token)
-                positions.append(seq.num_cached_tokens)
+                p = seq.num_cached_tokens + seq.rope_delta
+                positions.append(p)
+                if mrope:
+                    for r in range(3):
+                        pos_rows[r].append(p)
+            row_ranges.append((row0, len(input_ids)))
 
             lens_q.append(seqlen_q)
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
@@ -639,6 +745,8 @@ class ModelRunner:
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)
 
+        if mrope:
+            positions = pos_rows
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -646,9 +754,13 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         num_decode, fi_decode, fi_prefill = self.plan_flashinfer(seqs)
         linear_state_ids = self._linear_state_context(seqs)
+        vision_embeds = self._stage_vision_embeds(seqs, row_ranges, chunk_ranges)
         set_context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                     slot_mapping, block_tables, num_decode, fi_decode, fi_prefill,
-                    linear_state_ids=linear_state_ids, lens_q=lens_q)
+                    linear_state_ids=linear_state_ids, lens_q=lens_q,
+                    vision_embeds=vision_embeds)
+        for seq in seqs:
+            self._release_vision_state(seq)
         return input_ids, positions, is_uniform_decode
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -710,6 +822,7 @@ class ModelRunner:
         graph_vars["cu_seqlens_k"][:bs + 1] = context.cu_seqlens_k
         graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
         if "linear_state_ids" in graph_vars:
+            graph_vars["linear_state_ids"].fill_(self.linear_dummy_slot)
             graph_vars["linear_state_ids"][:bs] = context.linear_state_ids
         if self._graph_sampling and self.rank == self.sampler_rank:
             # Inputs for the in-graph sampler (stream-ordered before the
@@ -1180,8 +1293,11 @@ class ModelRunner:
         rows = torch.tensor(prev_rows, dtype=torch.int64,
                             pin_memory=True).cuda(non_blocking=True)
         input_ids = self._sampled_ring[src_ring_idx][rows]      # device gather
-        positions = torch.tensor([c - 1 for c in computed], dtype=torch.int64,
-                                 pin_memory=True).cuda(non_blocking=True)
+        # Pure decode stays 1D even for multimodal seqs: the three MRoPE
+        # sections share num_computed - 1 + rope_delta.
+        positions = torch.tensor(
+            [c - 1 + s.rope_delta for c, s in zip(computed, seqs)],
+            dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slots = [s.block_table[(c - 1) // block_size] * block_size + (c - 1) % block_size
                  for s, c in zip(seqs, computed)]
         slot_mapping = torch.tensor(slots, dtype=torch.int32,
@@ -1220,27 +1336,51 @@ class ModelRunner:
         bs = len(seqs)
         blk = self.block_size
         positions = []
+        # MRoPE rows for multimodal prefill chunks (see _prepare_batch_cpu);
+        # decode rows and text chunks repeat one position across sections.
+        mrope = any(s.mrope_positions is not None for s in seqs[n1:])
+        pos_rows: list[list[int]] = [[], [], []]
         slot_mapping = []
         cu_q = [0]
         cu_k = [0]
         max_q = 0
         max_k = 0
+        row_ranges: list[tuple[int, int]] = []
+        chunk_ranges: list[tuple[int, int]] = []
+        n_rows = 0
         for i, seq in enumerate(seqs):
+            row0 = n_rows
             if i < n1:
                 c = seq.num_computed_tokens
-                positions.append(c - 1)
+                p = c - 1 + seq.rope_delta
+                positions.append(p)
+                if mrope:
+                    for r in range(3):
+                        pos_rows[r].append(p)
                 slot_mapping.append(
                     seq.block_table[(c - 1) // blk] * blk + (c - 1) % blk)
                 lens, seqlen_k = 1, c
+                chunk_ranges.append((0, 0))
             else:
                 chunk = seq.num_scheduled_tokens
                 start = seq.num_computed_tokens - chunk
-                positions.extend(range(start, start + chunk))
+                if seq.mrope_positions is not None:
+                    seg = seq.mrope_positions[:, start:start + chunk]
+                    for r in range(3):
+                        pos_rows[r].extend(seg[r].tolist())
+                else:
+                    positions.extend(range(start, start + chunk))
+                    if mrope:
+                        for r in range(3):
+                            pos_rows[r].extend(range(start, start + chunk))
                 for j in range(chunk):
                     pos = start + j
                     slot_mapping.append(
                         seq.block_table[pos // blk] * blk + pos % blk)
                 lens, seqlen_k = chunk, start + chunk
+                chunk_ranges.append((start, start + chunk))
+            row_ranges.append((row0, n_rows + lens))
+            n_rows += lens
             cu_q.append(cu_q[-1] + lens)
             cu_k.append(cu_k[-1] + seqlen_k)
             max_q = max(max_q, lens)
@@ -1259,6 +1399,8 @@ class ModelRunner:
             input_ids = torch.cat([dec_ids, pre]) if n1 else pre
         else:
             input_ids = dec_ids
+        if mrope:
+            positions = pos_rows
         positions = torch.tensor(positions, dtype=torch.int64,
                                  pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32,
@@ -1269,10 +1411,14 @@ class ModelRunner:
                                     pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         linear_state_ids = self._linear_state_context(seqs)
+        vision_embeds = self._stage_vision_embeds(seqs, row_ranges, chunk_ranges)
         set_context(cu_seqlens_q, cu_seqlens_k, max_q, max_k,
                     slot_mapping, block_tables, n1, None, None,
                     linear_state_ids=linear_state_ids,
-                    lens_q=[cu_q[i + 1] - cu_q[i] for i in range(bs)])
+                    lens_q=[cu_q[i + 1] - cu_q[i] for i in range(bs)],
+                    vision_embeds=vision_embeds)
+        for seq in seqs:
+            self._release_vision_state(seq)
         self._async_input_ids = input_ids
         self._async_positions = positions
         self._async_is_uniform = False
@@ -1322,6 +1468,8 @@ class ModelRunner:
             if seq.is_finished:
                 if self.use_dflash_draft:
                     self._dflash_ctx.pop(seq.seq_id, None)
+                self._vision_pixels.pop(seq.seq_id, None)
+                self._vision_embeds.pop(seq.seq_id, None)
                 if self.gpu_state is not None and hasattr(seq, '_gpu_row'):
                     self.gpu_state.free_row(seq._gpu_row)
                     del seq._gpu_row
@@ -1389,8 +1537,11 @@ class ModelRunner:
             residual_out = torch.zeros(max_bs, hf_config.hidden_size)
         # Linear-attention state slot ids (hybrid models); the recurrent
         # update inside the graph reads/writes fixed pool addresses, only
-        # this id buffer's contents change between replays.
-        linear_state_ids = (torch.zeros(max_bs, dtype=torch.int64)
+        # this id buffer's contents change between replays.  Default every
+        # row to the dummy slot: replayed pad rows (bs < graph size) must
+        # not touch any real sequence's state.
+        linear_state_ids = (torch.full((max_bs,), self.linear_dummy_slot,
+                                       dtype=torch.int64)
                             if self.linear_s_pool is not None else None)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         cu_seqlens_q = torch.zeros(max_bs + 1, dtype=torch.int32)

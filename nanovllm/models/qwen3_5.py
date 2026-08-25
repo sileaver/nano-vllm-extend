@@ -1,7 +1,13 @@
 """Qwen3.5 (hybrid gated-delta-net + sparse full attention) for nano-vllm.
 
-Text-only port of the language model inside transformers'
-Qwen3_5ForConditionalGeneration (Qwen/Qwen3.5-*).  Of the 24 layers, 18 are
+Port of transformers' Qwen3_5ForConditionalGeneration (Qwen/Qwen3.5-*):
+the language model below plus — for multimodal checkpoints — the vision
+tower (see qwen3_5_vision.py), whose merged patch embeddings replace
+image_token_id rows of the token embedding, and interleaved MRoPE
+positions ([3, N] T/H/W tables over image regions; see
+MRotaryEmbedding and utils/multimodal.py).
+
+Of the 24 layers, 18 are
 linear attention (gated delta net, Qwen3-Next style) carrying a recurrent
 state S [H, K, V] plus a causal-conv prefix instead of KV cache, and 6
 layers (every 4th) are standard GQA full attention with partial RoPE
@@ -22,7 +28,8 @@ null initial recurrent state — so no branch is needed.
 
 Tensor parallelism shards every projection, the conv channels and the
 recurrent state at v-head granularity (see Qwen3_5GatedDeltaNet); pipeline
-parallelism splits the 24 layers across stages (see Qwen3_5Model).
+parallelism splits the 24 layers across stages (see Qwen3_5Model).  The
+vision tower is replicated across TP ranks on the first pipeline stage.
 """
 import re
 import torch
@@ -37,6 +44,7 @@ from nanovllm.layers.linear import ColumnParallelLinear, MergedColumnParallelLin
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.models.qwen3 import PipelineLayerShell, split_layers
+from nanovllm.models.qwen3_5_vision import Qwen3_5VisionModel
 from nanovllm.utils.context import get_context
 from nanovllm.utils.parallel import get_pp_rank, get_pp_size, get_tp_rank, get_tp_size
 
@@ -641,11 +649,13 @@ class Qwen3_5Attention(nn.Module):
         self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rope_params = getattr(config, "rope_parameters", None) or {}
         rotary_dim = int(self.head_dim * rope_params.get("partial_rotary_factor", 1.0))
+        mrope_section = rope_params.get("mrope_section")
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=rotary_dim,
             max_position=config.max_position_embeddings,
             base=rope_params.get("rope_theta", 10000000.0),
+            mrope_section=tuple(mrope_section) if mrope_section else None,
         )
         self.attn = Attention(
             self.num_heads,
@@ -1031,12 +1041,18 @@ class Qwen3_5DecoderLayer(nn.Module):
 
 class Qwen3_5Model(nn.Module):
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, vision_config=None, image_token_id=None) -> None:
         super().__init__()
         self.pp_first = get_pp_rank() == 0
         self.pp_last = get_pp_rank() == get_pp_size() - 1
         self.start_layer, self.end_layer = split_layers(
             config.num_hidden_layers, get_pp_size(), get_pp_rank())
+        # Multimodal: the vision tower lives on the first pipeline stage
+        # only, replicated over TP ranks (its output is scattered into the
+        # all-reduced token embeddings, so every rank stays in agreement).
+        self.visual = (Qwen3_5VisionModel(vision_config)
+                       if self.pp_first and vision_config is not None else None)
+        self.image_token_id = image_token_id
         if self.pp_first:
             self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         else:
@@ -1051,8 +1067,24 @@ class Qwen3_5Model(nn.Module):
         """True for checkpoint weights this pipeline stage does not own."""
         if self.embed_tokens is None and ".embed_tokens." in weight_name:
             return True
+        if self.visual is None and ".visual." in weight_name:
+            return True
         m = re.search(r"\.layers\.(\d+)\.", weight_name)
         return bool(m) and not (self.start_layer <= int(m.group(1)) < self.end_layer)
+
+    def _scatter_vision_embeds(self, input_ids: torch.Tensor,
+                               hidden_states: torch.Tensor) -> torch.Tensor:
+        """Replace image_token_id rows with vision-tower embeddings.
+
+        context.vision_embeds (built by ModelRunner alongside the batch)
+        holds per-seq (row range, embedding slice) pairs — the slice a
+        chunk scatters is its prefix of pending image tokens, so chunked
+        prefill crossing an image region stays row-aligned."""
+        for row_start, row_end, embeds in get_context().vision_embeds:
+            rows = hidden_states[row_start:row_end]
+            mask = input_ids[row_start:row_end] == self.image_token_id
+            rows[mask] = embeds
+        return hidden_states
 
     def forward(
         self,
@@ -1069,6 +1101,8 @@ class Qwen3_5Model(nn.Module):
         if hidden_states is None:
             hidden_states = self.embed_tokens(input_ids)
             residual = None
+            if self.visual is not None:
+                hidden_states = self._scatter_vision_embeds(input_ids, hidden_states)
         for layer in self.layers:
             if isinstance(layer, PipelineLayerShell):
                 continue
@@ -1087,13 +1121,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
     # The checkpoint is a multimodal shell: strip the language-model prefix
-    # and skip the vision tower / MTP head (text-only inference).
+    # and skip the MTP head.  ``visual`` (None for text-only builds, e.g.
+    # NANOVLLM_QWEN35_TEXTONLY=1) keeps the vision tower weights loading.
     weight_remapping = (("model.language_model.", "model."),)
-    ignored_weight_prefixes = ("model.visual.", "mtp.")
+    ignored_weight_prefixes = ("mtp.",)
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, vision_config=None, image_token_id=None) -> None:
         super().__init__()
-        self.model = Qwen3_5Model(config)
+        self.model = Qwen3_5Model(config, vision_config, image_token_id)
         self.pp_first, self.pp_last = self.model.pp_first, self.model.pp_last
         if self.pp_last:
             self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)

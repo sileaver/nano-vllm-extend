@@ -29,6 +29,12 @@ class Context:
     # GPU→CPU sync.  None when the caller didn't provide them (falls back
     # to a .tolist() on the tensor).
     lens_q: list[int] | None = None
+    # Multimodal prefill: per-seq (row_start, row_end, image_embeds) triples
+    # — vision-tower embeddings (already sliced to this chunk's pending
+    # image tokens) replacing image_token_id rows after embedding.  Built
+    # by ModelRunner.prepare_*; consumed by Qwen3_5Model._scatter_vision_embeds
+    # on the first pipeline stage.  Decode steps leave it empty.
+    vision_embeds: tuple = ()
 
 
 _CONTEXT = Context()
@@ -42,13 +48,13 @@ def set_context(cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen
                 slot_mapping=None, block_tables=None, num_decode_tokens=0,
                 flashinfer_decode=None, flashinfer_prefill=None,
                 draft_slot_mapping=None, draft_block_tables=None,
-                linear_state_ids=None, lens_q=None):
+                linear_state_ids=None, lens_q=None, vision_embeds=()):
     global _CONTEXT
     _CONTEXT = Context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                        slot_mapping, block_tables, num_decode_tokens,
                        flashinfer_decode, flashinfer_prefill,
                        draft_slot_mapping, draft_block_tables,
-                       linear_state_ids, lens_q)
+                       linear_state_ids, lens_q, vision_embeds)
 
 
 def reset_context():

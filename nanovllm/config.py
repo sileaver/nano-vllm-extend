@@ -38,6 +38,14 @@ class Config:
     spec_draft_model: str = ""
     num_draft_kvcache_blocks: int = -1
     draft_hf_config: AutoConfig | None = None
+    # Multimodal (qwen3_5 shell checkpoints): outer vision half.  None for
+    # text-only models or NANOVLLM_QWEN35_TEXTONLY=1.  image_token_id etc.
+    # are set alongside (see __post_init__).
+    vision_config: AutoConfig | None = None
+    image_token_id: int = -1
+    video_token_id: int = -1
+    vision_start_token_id: int = -1
+    vision_end_token_id: int = -1
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -52,10 +60,23 @@ class Config:
         hf_config = AutoConfig.from_pretrained(self.model)
         # Multimodal shells (e.g. Qwen3.5's Qwen3_5ForConditionalGeneration)
         # nest the language model inside text_config — unwrap it so every
-        # downstream consumer sees a plain text config.
-        if getattr(hf_config, "text_config", None) is not None:
+        # downstream consumer sees a plain text config, but keep the outer
+        # shell's vision half for multimodal builds (NANOVLLM_QWEN35_TEXTONLY=1
+        # restores the old text-only behaviour).
+        shell = hf_config if getattr(hf_config, "text_config", None) is not None else None
+        if shell is not None:
             hf_config = hf_config.text_config
         self.hf_config = hf_config
+        text_only = os.environ.get("NANOVLLM_QWEN35_TEXTONLY", "0") == "1"
+        if (shell is not None and not text_only
+                and getattr(shell, "vision_config", None) is not None):
+            self.vision_config = shell.vision_config
+            self.image_token_id = shell.image_token_id
+            self.video_token_id = getattr(shell, "video_token_id", None)
+            self.vision_start_token_id = getattr(shell, "vision_start_token_id", None)
+            self.vision_end_token_id = getattr(shell, "vision_end_token_id", None)
+        else:
+            self.vision_config = None
         if "qwen3_5" in hf_config.model_type:
             # Hybrid architecture: TP shards the GDN heads (num_v_heads must
             # divide evenly).  Spec decode (state rollback), gpu_prepare and

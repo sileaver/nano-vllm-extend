@@ -13,6 +13,8 @@ from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.scheduler import Scheduler, SchedulerOutput
 from nanovllm.engine.async_scheduler import AsyncScheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.utils.multimodal import (
+    mm_token_types_from_ids, qwen35_mrope_positions)
 
 
 @dataclass
@@ -165,12 +167,57 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: str | list[int] | dict,
+                    sampling_params: SamplingParams, images=None):
+        """``prompt`` may be a string, token list, or — for multimodal
+        models — a dict ``{"prompt": ..., "images": [...]}`` (``images``
+        also accepted as a separate argument).  Images are processed by
+        the checkpoint's own processor (Qwen3VL style); the prompt string
+        must contain the ``<|vision_start|><|image_pad|><|vision_end|>``
+        placeholder the processor expands per image."""
         assert self.config.data_parallel_size == 1, \
             "data parallelism supports generate() only (requests are sharded by the driver)"
-        if isinstance(prompt, str):
+        if isinstance(prompt, dict):
+            images = prompt.get("images", images)
+            prompt = prompt["prompt"]
+        pixel_values = image_grid_thw = mrope_positions = None
+        rope_delta = 0
+        if images:
+            assert self.config.vision_config is not None, \
+                "images passed to a text-only engine (or NANOVLLM_QWEN35_TEXTONLY=1)"
+            if not hasattr(self, "processor"):
+                from transformers import AutoProcessor
+                self.processor = AutoProcessor.from_pretrained(self.config.model)
+            assert isinstance(prompt, str), "image prompts must be text"
+            inputs = self.processor(text=[prompt], images=images,
+                                    return_tensors="pt", padding=True)
+            assert getattr(inputs, "pixel_values_videos", None) is None, \
+                "video inputs are not supported"
+            prompt = inputs.input_ids[0].tolist()
+            # bf16 is lossless here — the tower casts to its dtype on
+            # entry (the reference's pixel_values.type(visual.dtype)), and
+            # halved payloads keep the TP shm command segment small.
+            pixel_values = inputs.pixel_values.to(torch.bfloat16)
+            image_grid_thw = inputs.image_grid_thw.tolist()
+            mm_types = (inputs.mm_token_type_ids[0].tolist()
+                        if getattr(inputs, "mm_token_type_ids", None) is not None
+                        else mm_token_types_from_ids(
+                            prompt, self.config.image_token_id,
+                            self.config.video_token_id))
+            merge = self.config.vision_config.spatial_merge_size
+            n_tokens = sum(t * h * w // merge ** 2
+                           for t, h, w in image_grid_thw)
+            assert prompt.count(self.config.image_token_id) == n_tokens, \
+                "image placeholder / grid token count mismatch"
+            mrope_positions, rope_delta = qwen35_mrope_positions(
+                prompt, mm_types, image_grid_thw, merge)
+        elif isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(prompt, sampling_params,
+                       pixel_values=pixel_values,
+                       image_grid_thw=image_grid_thw,
+                       mrope_positions=mrope_positions,
+                       rope_delta=rope_delta)
         if self.collect_timing:
             import time
             seq.timing = True
@@ -367,11 +414,15 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
+        prompts: list[str] | list[list[int]] | list[dict],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
+        """``prompts`` entries may be dicts (multimodal): ``{"prompt": ...,
+        "images": [...]}`` — see add_request."""
         if self.config.data_parallel_size > 1:
+            assert not any(isinstance(p, dict) for p in prompts), \
+                "data parallelism supports text prompts only"
             return self._generate_dp(prompts, sampling_params, use_tqdm)
         return self._generate_single(prompts, sampling_params, use_tqdm)
 

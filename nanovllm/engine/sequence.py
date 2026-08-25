@@ -16,7 +16,9 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(),
+                 pixel_values=None, image_grid_thw: list[list[int]] | None = None,
+                 mrope_positions=None, rope_delta: int = 0):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -32,6 +34,17 @@ class Sequence:
         # Hybrid models: slot into the linear-attention recurrent-state pool
         # (-1 = unallocated; assigned by the scheduler on first scheduling).
         self.linear_state_id = -1
+        # Multimodal payload (Qwen3.5-style): processor-emitted pixel rows
+        # [n_patches, C*T*P*P] (CPU float) + per-image patch grids [t, h, w];
+        # precomputed MRoPE positions [3, num_prompt_tokens] for prefill
+        # chunks and the decode-time scalar offset (the port of
+        # Qwen3_5Model.get_rope_index lives in nanovllm/utils/multimodal.py).
+        # Text-only sequences keep everything at None/0 — positions stay a
+        # plain arange exactly as before.
+        self.pixel_values = pixel_values
+        self.image_grid_thw = image_grid_thw
+        self.mrope_positions = mrope_positions
+        self.rope_delta = rope_delta
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
@@ -95,12 +108,20 @@ class Sequence:
         # Prefill seqs ship their full token list (workers re-run the
         # scheduled chunk from it); decode seqs only need the last token.
         last_state = self.last_token if not self.is_prefill else self.token_ids
+        # Multimodal: pixels and the [3, len] MRoPE table only travel with
+        # prefill states (a decode step re-derives positions from
+        # rope_delta); a preempted seq flips back to is_prefill and ships
+        # them again.
+        pixel_values = self.pixel_values if self.is_prefill else None
+        mrope_positions = self.mrope_positions if self.is_prefill else None
         return (self.seq_id, self.status, self.is_prefill,
                 self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
                 self.num_scheduled_tokens, self.num_output_placeholders,
                 self.block_table, self.draft_block_table, self.linear_state_id,
                 self.temperature, self.top_k, self.top_p,
-                self.max_tokens, self.ignore_eos, last_state)
+                self.max_tokens, self.ignore_eos, last_state,
+                pixel_values, self.image_grid_thw, mrope_positions,
+                self.rope_delta)
 
     def __setstate__(self, state):
         (self.seq_id, self.status, self.is_prefill,
@@ -108,7 +129,12 @@ class Sequence:
          self.num_scheduled_tokens, self.num_output_placeholders,
          self.block_table, self.draft_block_table, self.linear_state_id,
          self.temperature, self.top_k, self.top_p,
-         self.max_tokens, self.ignore_eos, last_state) = state
+         self.max_tokens, self.ignore_eos, last_state,
+         pixel_values, image_grid_thw, mrope_positions, rope_delta) = state
+        self.pixel_values = pixel_values
+        self.image_grid_thw = image_grid_thw
+        self.mrope_positions = mrope_positions
+        self.rope_delta = rope_delta
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
