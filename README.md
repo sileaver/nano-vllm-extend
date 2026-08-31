@@ -156,9 +156,10 @@ Measured on RTX 5090 (decode-bound): Qwen3-0.6B @ bs=64 20.1k → 22.6k tok/s
 parallelism (more CPU/NCCL overhead to hide): Qwen3-0.6B @ tp2 11.9k → 19.0k
 (+59%), Qwen3.5-2B @ tp2 10.1k → 11.4k (+11.7%).
 
-Together with the GDN optimizations below this reaches parity with vLLM 0.27
-on ragged serving workloads (mixed 9.5k → 22.4k tok/s vs 23.3k, prefill
-33.6k → 62.8k vs 62.5k, decode within 3–5%).
+Together with the GDN optimizations below this reaches parity with vLLM
+0.27 on ragged serving workloads — mixed throughput went **9.5k → 22.7k
+tok/s (~41% → 98% of vLLM)** in the course of that rework (full
+head-to-head table in the Benchmark section below).
 
 ## Hybrid-model (GDN) optimizations
 
@@ -240,14 +241,51 @@ python tests/async_check.py               # async scheduler output equivalence
 `tests/smoke_check_qwen35.py` (random weights, loose thresholds) also runs;
 its pass rate is unchanged by this work.
 
-## Benchmark
+## Benchmark: head-to-head vs vLLM
 
-Upstream reference numbers (RTX 4070 laptop, Qwen3-0.6B, 256 requests of
-100–1024 in/out): nano-vllm **1434 tok/s** vs vLLM **1362 tok/s**. This
-fork's own numbers on RTX 5090 are quoted inline in the sections above;
-reproduce them with `benchmarks/bench1.py` (nano) vs `benchmarks/bench.py`
-(vLLM baseline), `benchmarks/bench_vs_vllm.py` (head-to-head ragged serving)
-and `benchmarks/bench_parallel.py`.
+Same workload, same GPU, both engines in their best scheduling config
+(vLLM `async_scheduling`; nano-vllm `continuous_batching +
+async_scheduling`), shape-matched warmup, 3 timed reps — median shown
+(reps vary <2%). Reproduce with `benchmarks/bench_vs_vllm.py`.
+
+**Hardware/software**: 1× RTX 5090, torch 2.13 / cu130, vLLM 0.27.1,
+bf16, temperature 0.6, `ignore_eos`, 256 requests, `max_model_len` 4096.
+Raw per-rep output: `benchmarks/results/vs-vllm-rtx5090.log`.
+
+**Qwen3.5-2B** (the hybrid GDN model ported in this fork — vLLM runs its
+hand-tuned kernels, nano-vllm the clean-room port):
+
+| Workload | nano-vllm | vLLM 0.27.1 | nano / vLLM |
+|---|---|---|---|
+| mixed serving — in/out ~ U(100, 1024) | **22.7k** total / 11.0k out tok/s | 23.1k / 11.2k | **98.3%** |
+| decode-bound — 64-token prompts, 256 out | **20.3k** total / 16.2k out tok/s | 20.1k / 16.0k | **101%** |
+| prefill-bound — 2048-token prompts, 2 out | **61.0k** total tok/s | 62.1k | **98.2%** |
+
+**Qwen3-0.6B** (dense model, upstream code path + this fork's async
+scheduling):
+
+| Workload | nano-vllm | vLLM 0.27.1 | nano / vLLM |
+|---|---|---|---|
+| mixed serving — in/out ~ U(100, 1024) | **23.7k** total / 11.5k out tok/s | 23.5k / 11.4k | **101%** |
+| decode-bound — 64-token prompts, 256 out | **45.0k** total / 36.0k out tok/s | 43.5k / 34.8k | **103%** |
+
+Reading: on the dense model nano-vllm matches or beats vLLM (decode
++3% — the CUDA-graph + fused-sampling path); on the hybrid model it lands
+within ~2% of vLLM's tuned GDN kernels across all three regimes. The
+remaining gap is GDN mixed-batch handling (see the optimization notes
+above) — the mixed-mode number was **9.5k tok/s (~41% of vLLM) before**
+the varlen-GDN and unified-async rework.
+
+```bash
+OMP_NUM_THREADS=8 python benchmarks/bench_vs_vllm.py            # both engines, mixed
+OMP_NUM_THREADS=8 python benchmarks/bench_vs_vllm.py --mode decode
+OMP_NUM_THREADS=8 python benchmarks/bench_vs_vllm.py --mode prefill
+# per-mode workloads are defined in the script header
+```
+
+Further benches: `benchmarks/bench1.py` (nano standalone),
+`benchmarks/bench.py` (vLLM baseline), `benchmarks/bench_parallel.py`
+(tp/pp/dp scaling).
 
 ## License
 
