@@ -14,12 +14,17 @@ def main():
     max_input_len = 1024
     max_output_len = 1024
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    # path = os.path.expanduser("~/huggingface/Qwen3.5-2B/")
+    # path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.path.expanduser("~/huggingface/Qwen3.5-2B/")
     llm = LLM(
         model=path,
         enforce_eager=False,
         max_model_len=4096,
+        # Best-config flags (what bench_vs_vllm.py runs and what the README
+        # tables quote) — the legacy scheduler without them loses ~5% mixed
+        # throughput to sync CPU-GPU handoffs and prefill-draining.
+        continuous_batching=True,
+        async_scheduling=True,
         # collect_timing=True,
         # data_parallel_size=2
         # sampling_backend="flashinfer"
