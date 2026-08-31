@@ -365,9 +365,43 @@ def fused_g_beta(b, a, a_log, dt_bias, mask):
 _USE_GDN_GBETA = _os.environ.get("NANOVLLM_GDN_GBETA", "1") == "1"
 
 
+# ── Fused attention output gate (o = o · sigmoid(g)) ─────────────────
+# The eager form ran two full-activation elementwise kernels per
+# attention layer (sigmoid, then mul) plus a hidden contiguous copy —
+# gate.flatten(1,-1) on the strided q_proj view materialises the gate.
+# One row-wise kernel reads o and the strided gate directly and writes o
+# in place.  Rounding follows torch exactly: sigmoid in fp32 rounded to
+# bf16, then an fp32 multiply with a single bf16 round.
+@triton.jit
+def _sigmoid_mul_kernel(
+    X, G, x_stride_n, x_stride_h, g_stride_n, g_stride_h,
+    HEADS: tl.constexpr, DIM: tl.constexpr,
+):
+    pid = tl.program_id(0)            # one program per (token, head) row
+    n = pid // HEADS
+    h = pid % HEADS
+    offs = tl.arange(0, DIM)
+    x = tl.load(X + n * x_stride_n + h * x_stride_h + offs).to(tl.float32)
+    g = tl.load(G + n * g_stride_n + h * g_stride_h + offs).to(tl.float32)
+    sig = tl.sigmoid(g).to(X.dtype.element_ty).to(tl.float32)
+    y = (x * sig).to(X.dtype.element_ty)
+    tl.store(X + n * x_stride_n + h * x_stride_h + offs, y)
+
+
+def sigmoid_mul_(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """x [N, H, D] (fresh, contiguous) mutated in place: x *= sigmoid(gate);
+    gate may be a strided view (e.g. the second half of a packed q_proj
+    output).  Returns x."""
+    n, heads, dim = x.shape
+    _sigmoid_mul_kernel[(n * heads,)](
+        x, gate, x.stride(0), x.stride(1), gate.stride(0), gate.stride(1),
+        HEADS=heads, DIM=dim, num_warps=2)
+    return x
+
+
 @triton.jit
 def _causal_conv_silu_varlen_kernel(
-    X, S, W, Y, LENS, CUSEQ, C, sXn, sSn, sSc,
+    X, S, W, Y, LENS, CUSEQ, C, D3, sXn, sSn, sSc, sYp,
     K: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
 ):
     """Varlen depthwise causal conv + SiLU over flat x [N, C] rows.
@@ -377,16 +411,25 @@ def _causal_conv_silu_varlen_kernel(
     varlen GEMMs and nothing is padded.  The conv window never crosses a
     sequence boundary (p ∈ [0, T_r) by construction), and the state is
     rolled in place at the row's end (= T_r, all rows real).
+
+    Output layout: Y is [3, N, C//3] — the q, k, v thirds of the packed
+    conv channels land in three separately-contiguous slabs, so the
+    downstream [N, H, D] views are contiguous and the fla chunk kernel's
+    input_guard does not re-copy all three (that copy chain showed up as
+    ~1.7% of prefill GPU time).  A channel block never straddles thirds
+    (C//3 % BLOCK_C == 0).
     """
     r = tl.program_id(0)
     pc = tl.program_id(1)
     offs_c = pc * BLOCK_C + tl.arange(0, BLOCK_C)
     cm = offs_c < C
+    part = (pc * BLOCK_C) // D3
+    local = offs_c - part * D3
     T = tl.load(LENS + r)
-    base = tl.load(CUSEQ + r) * sXn
-    Xr = X + base
+    row0 = tl.load(CUSEQ + r)          # global row of this sequence
+    Xr = X + row0 * sXn
     Sn = S + r * sSn
-    Yr = Y + base
+    Yr = Y + part * sYp + row0 * D3 + local
     for t0 in range(0, T, BLOCK_T):
         offs_t = t0 + tl.arange(0, BLOCK_T)
         acc = tl.zeros((BLOCK_C, BLOCK_T), dtype=tl.float32)
@@ -401,7 +444,7 @@ def _causal_conv_silu_varlen_kernel(
             w_i = tl.load(W + offs_c * K + i, mask=cm, other=0.0).to(tl.float32)
             acc += (xv.to(tl.float32) + sv.to(tl.float32)) * w_i[:, None]
         y = acc * tl.sigmoid(acc)
-        tl.store(Yr + offs_c[:, None] + offs_t[None, :] * sXn,
+        tl.store(Yr[:, None] + offs_t[None, :] * D3,
                  y.to(Y.dtype.element_ty),
                  mask=cm[:, None] & (offs_t < T)[None, :])
     for i in tl.static_range(K - 1):
@@ -415,13 +458,16 @@ def _causal_conv_silu_varlen_kernel(
 
 def causal_conv_silu_varlen(x, state, weight, lens, cuseq):
     """x [N, C] bf16 contiguous varlen; state [n, C, K-1] (updated in
-    place); lens int32 [n] GPU; cuseq int32 [n] GPU (per-row starts)."""
+    place); lens int32 [n] GPU; cuseq int32 [n] GPU (per-row starts).
+    Returns [3, N, C//3]: the q/k/v thirds, each contiguous."""
     N, C = x.shape
     K = weight.shape[-1]
-    y = torch.empty(N, C, dtype=x.dtype, device=x.device)
+    d3 = C // 3
+    assert d3 * 3 == C and d3 % 64 == 0
+    y = torch.empty(3, N, d3, dtype=x.dtype, device=x.device)
     _causal_conv_silu_varlen_kernel[(lens.shape[0], triton.cdiv(C, 64))](
-        x, state, weight, y, lens, cuseq, C,
-        x.stride(0), state.stride(0), state.stride(1),
+        x, state, weight, y, lens, cuseq, C, d3,
+        x.stride(0), state.stride(0), state.stride(1), y.stride(0),
         K=K, BLOCK_T=64, BLOCK_C=64, num_warps=4,
     )
     return y
@@ -678,8 +724,8 @@ class Qwen3_5Attention(nn.Module):
         v = self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
-        o = o.flatten(1, -1) * torch.sigmoid(gate.flatten(1, -1))
-        return self.o_proj(o)
+        o = sigmoid_mul_(o, gate)                      # in place: o · σ(gate)
+        return self.o_proj(o.flatten(1, -1))
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -844,16 +890,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         mixed = self.in_proj_qkv(hidden)                # [N, conv_dim]
         cu_gpu, lens_gpu, cu64_cpu, cu64_gpu = _varlen_meta(lens_q)
         conv_state = self.conv_cache[ids]
-        mixed = causal_conv_silu_varlen(
+        y3 = causal_conv_silu_varlen(
             mixed, conv_state,
             self.conv1d.weight.view(self.conv_dim, self.conv_kernel),
             lens_gpu, cu_gpu[:-1])
         self.conv_cache[ids] = conv_state
-        q, k, v = mixed.split([self.key_dim, self.key_dim, self.value_dim],
-                              dim=1)
-        q = q.view(-1, self.num_k_heads, self.head_k_dim)
-        k = k.view(-1, self.num_k_heads, self.head_k_dim)
-        v = v.view(-1, self.num_v_heads, self.head_v_dim)
+        # y3 [3, N, part_dim]: q/k/v land contiguous, so the fla chunk
+        # kernel's input_guard does not re-copy each 64MB slab.
+        q = y3[0].view(-1, self.num_k_heads, self.head_k_dim)
+        k = y3[1].view(-1, self.num_k_heads, self.head_k_dim)
+        v = y3[2].view(-1, self.num_v_heads, self.head_v_dim)
         if self.num_v_heads > self.num_k_heads:
             rep = self.num_v_heads // self.num_k_heads
             q = q.repeat_interleave(rep, dim=1)

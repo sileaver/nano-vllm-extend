@@ -1,5 +1,9 @@
 from functools import lru_cache
+import os
+
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 
 
@@ -12,6 +16,57 @@ def apply_rotary_emb(
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
     return torch.cat((y1, y2), dim=-1).to(x.dtype)
+
+
+# ── Fused in-place RoPE ──────────────────────────────────────────────
+# The eager chain (4 muls + 2 add/sub + inner cat per tensor, then the
+# partial-rope outer cat copying the FULL head) showed up as ~2.5% of
+# prefill GPU time — 564 elementwise + 144 cat kernels per run.  One
+# Triton kernel per q/k rotates the leading rotary_dim channels in place
+# (the pass-through tail is never touched).  NANOVLLM_FUSED_ROPE=0
+# restores the eager reference path.
+_USE_FUSED_ROPE = os.environ.get("NANOVLLM_FUSED_ROPE", "1") == "1"
+
+
+@triton.jit
+def _partial_rope_kernel(
+    X, CACHE, POS,
+    x_stride_n, x_stride_h, cache_stride,
+    HALF: tl.constexpr, HEADS: tl.constexpr,
+):
+    """One program per (token, head): rotate X[n, h, :2*HALF] in place
+    with cos/sin from CACHE[POS[n]] (row layout: cos | sin, HALF each).
+    Math in fp32 with a single bf16 rounding — identical to the eager
+    reference."""
+    pid = tl.program_id(0)
+    n = pid // HEADS
+    h = pid % HEADS
+    pos = tl.load(POS + n)
+    base = CACHE + pos * cache_stride
+    offs = tl.arange(0, HALF)
+    cos = tl.load(base + offs)
+    sin = tl.load(base + HALF + offs)
+    xp = X + n * x_stride_n + h * x_stride_h
+    x1 = tl.load(xp + offs).to(tl.float32)
+    x2 = tl.load(xp + HALF + offs).to(tl.float32)
+    tl.store(xp + offs, (x1 * cos - x2 * sin).to(X.dtype.element_ty))
+    tl.store(xp + HALF + offs, (x2 * cos + x1 * sin).to(X.dtype.element_ty))
+
+
+def rope_inplace_(cache: torch.Tensor, positions: torch.Tensor,
+                  x: torch.Tensor, rotary_dim: int) -> torch.Tensor:
+    """Rotate x [N, H, head] in place over its first rotary_dim channels
+    (half-split convention).  Returns x."""
+    n, heads, _ = x.shape
+    half = rotary_dim // 2
+    assert x.stride(-1) == 1 and half == triton.next_power_of_2(half)
+    _partial_rope_kernel[(n * heads,)](
+        x, cache, positions,
+        x.stride(0), x.stride(1), cache.stride(0),
+        HALF=half, HEADS=heads,
+        num_warps=1,
+    )
+    return x
 
 
 class RotaryEmbedding(nn.Module):
@@ -42,6 +97,12 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if _USE_FUSED_ROPE:
+            # In-place: query/key are views of this step's fresh qkv
+            # projection output, safe to mutate.
+            rope_inplace_(self.cos_sin_cache, positions, query, self.rotary_dim)
+            rope_inplace_(self.cos_sin_cache, positions, key, self.rotary_dim)
+            return query, key
         return _rope_forward(
             self.cos_sin_cache, self.rotary_dim, self.head_size,
             positions, query, key,
@@ -134,6 +195,10 @@ class MRotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if positions.dim() == 1:
             # Uniform positions: identical to plain RoPE.
+            if _USE_FUSED_ROPE:
+                rope_inplace_(self.cos_sin_cache, positions, query, self.rotary_dim)
+                rope_inplace_(self.cos_sin_cache, positions, key, self.rotary_dim)
+                return query, key
             return _rope_forward(
                 self.cos_sin_cache, self.rotary_dim, self.head_size,
                 positions, query, key,

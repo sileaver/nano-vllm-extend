@@ -176,6 +176,15 @@ head-to-head table in the Benchmark section below).
 * **In-place recurrent decode** — the decode step used to gather a 450MB
   state batch, run the recurrent, and scatter back; a custom kernel now
   indexes pool rows directly (~40% of decode time saved at bs≈218).
+* **Copy-free GDN prefill plumbing** — profiling against vLLM found the
+  fla chunk kernel's input guard re-copying the q/k/v slabs (3×64MB per
+  layer, ~1.7% of prefill time): the varlen causal-conv kernel now writes
+  its output as three separately-contiguous `[N, H, D]` slabs so nothing
+  downstream copies.  RoPE and the attention output gate got the same
+  treatment — one in-place Triton kernel each instead of a ~16-kernel
+  eager chain plus full-head copies (bit-exact vs the eager forms;
+  `NANOVLLM_FUSED_ROPE=0` A/Bs it).  Net: prefill 61.0k → 63.0k tok/s,
+  taking the hybrid model from −1.8% to **+1.5%** vs vLLM.
 
 ## Speculative decoding
 
@@ -257,24 +266,25 @@ hand-tuned kernels, nano-vllm the clean-room port):
 
 | Workload | nano-vllm | vLLM 0.27.1 | nano / vLLM |
 |---|---|---|---|
-| mixed serving — in/out ~ U(100, 1024) | **22.7k** total / 11.0k out tok/s | 23.1k / 11.2k | **98.3%** |
-| decode-bound — 64-token prompts, 256 out | **20.3k** total / 16.2k out tok/s | 20.1k / 16.0k | **101%** |
-| prefill-bound — 2048-token prompts, 2 out | **61.0k** total tok/s | 62.1k | **98.2%** |
+| prefill-bound — 2048-token prompts, 2 out | **63.0k** total tok/s | 62.1k | **101.5%** |
+| decode-bound — 64-token prompts, 256 out | **20.4k** total / 16.3k out tok/s | 20.1k / 16.0k | **101.5%** |
+| mixed serving — in/out ~ U(100, 1024) | **22.8k** total / 11.0k out tok/s | 23.1k / 11.2k | **98.7%** |
 
 **Qwen3-0.6B** (dense model, upstream code path + this fork's async
 scheduling):
 
 | Workload | nano-vllm | vLLM 0.27.1 | nano / vLLM |
 |---|---|---|---|
-| mixed serving — in/out ~ U(100, 1024) | **23.7k** total / 11.5k out tok/s | 23.5k / 11.4k | **101%** |
-| decode-bound — 64-token prompts, 256 out | **45.0k** total / 36.0k out tok/s | 43.5k / 34.8k | **103%** |
+| mixed serving — in/out ~ U(100, 1024) | **23.6k** total / 11.4k out tok/s | 23.5k / 11.4k | **100.4%** |
+| decode-bound — 64-token prompts, 256 out | **45.2k** total / 36.2k out tok/s | 43.5k / 34.8k | **103.9%** |
 
-Reading: on the dense model nano-vllm matches or beats vLLM (decode
-+3% — the CUDA-graph + fused-sampling path); on the hybrid model it lands
-within ~2% of vLLM's tuned GDN kernels across all three regimes. The
-remaining gap is GDN mixed-batch handling (see the optimization notes
-above) — the mixed-mode number was **9.5k tok/s (~41% of vLLM) before**
-the varlen-GDN and unified-async rework.
+Reading: nano-vllm matches or beats vLLM on both models — decode +2-4%
+(CUDA-graph + fused-sampling path), prefill +1.5% on the hybrid model.
+Mixed sits at 98.7%, inside the run-to-run spread (~1.3% across reps).
+This was not always so: mixed throughput was **9.5k tok/s (~41% of
+vLLM)** before the varlen-GDN and unified-async rework, and prefill sat
+2% behind until a profile pass found a hidden copy chain (see the
+optimization notes).
 
 ```bash
 OMP_NUM_THREADS=8 python benchmarks/bench_vs_vllm.py            # both engines, mixed
