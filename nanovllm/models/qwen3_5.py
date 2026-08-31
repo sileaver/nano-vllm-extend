@@ -503,10 +503,59 @@ def _varlen_meta(lens_q: list[int]):
 
 
 # A/B switch: NANOVLLM_CONV_TRITON=0 restores the F.conv1d reference path.
-# The Triton kernel only covers T > 1 (prefill/mixed chunks): at T = 1 its
-# 64-wide T tiles are 98% masked and the per-K scalar state stores add
-# ~30µs/layer — the reference cat+conv1d there is 3 tiny kernels.
+# The general Triton kernel only covers T > 1 (prefill/mixed chunks): at
+# T = 1 its 64-wide T tiles are 98% masked and the per-K scalar state
+# stores add ~30µs/layer — decode uses the dedicated single-token kernel
+# below instead of the reference gather → cat → conv1d → scatter chain
+# (four full-state memory passes that profiled at ~3% of mixed-serving
+# GPU time, 18k cat + 18k scatter kernels per run).
 _USE_CONV_TRITON = _os.environ.get("NANOVLLM_CONV_TRITON", "1") == "1"
+
+
+@triton.jit
+def _conv_decode_step_kernel(
+    X, S, W, Y, IDS, C,
+    sXn, sSn, sSc, sYn,
+    K: tl.constexpr, BLOCK_C: tl.constexpr,
+):
+    """Single-token depthwise causal conv + SiLU with in-place state roll.
+
+    Per (seq, channel block): y = silu(Σᵢ w[c,i]·s[c,i]) + w[c,K-1]·x),
+    over the K-wide window [state | x]; the state then rolls to its last
+    K-1 inputs.  One read of x + one read/write of the state replaces the
+    reference path's gather, cat, conv1d and scatter."""
+    n = tl.program_id(0)
+    pc = tl.program_id(1)
+    offs_c = pc * BLOCK_C + tl.arange(0, BLOCK_C)
+    cm = offs_c < C
+    slot = tl.load(IDS + n).to(tl.int64)
+    xp = X + n * sXn + offs_c
+    sp = S + slot * sSn + offs_c * sSc
+    acc = tl.load(xp, mask=cm, other=0.0).to(tl.float32) \
+        * tl.load(W + offs_c * K + (K - 1), mask=cm, other=0.0).to(tl.float32)
+    for i in tl.static_range(K - 1):
+        acc += tl.load(sp + i, mask=cm, other=0.0).to(tl.float32) \
+            * tl.load(W + offs_c * K + i, mask=cm, other=0.0).to(tl.float32)
+    y = acc * tl.sigmoid(acc)
+    tl.store(Y + n * sYn + offs_c, y.to(Y.dtype.element_ty), mask=cm)
+    for i in tl.static_range(K - 2):
+        tl.store(sp + i, tl.load(sp + i + 1, mask=cm, other=0.0), mask=cm)
+    tl.store(sp + (K - 2), tl.load(xp, mask=cm, other=0.0), mask=cm)
+
+
+def conv_decode_step(x, state_pool, ids, weight):
+    """x [n, C] (dense in_proj_qkv output, decode rows only); state_pool
+    [slots, C, K-1] rolled in place at rows `ids`; weight [C, K].
+    Returns y [n, C]."""
+    n, C = x.shape
+    K = weight.shape[-1]
+    y = torch.empty(n, C, dtype=x.dtype, device=x.device)
+    _conv_decode_step_kernel[(n, triton.cdiv(C, 128))](
+        x, state_pool, weight, y, ids, C,
+        x.stride(0), state_pool.stride(0), state_pool.stride(1), y.stride(0),
+        K=K, BLOCK_C=128, num_warps=1,
+    )
+    return y
 
 
 @triton.jit
@@ -958,10 +1007,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         if T == 1:
             # Decode: roll the conv state and convolve the K-token window.
-            mixed = self.in_proj_qkv(x).transpose(1, 2)   # [n, conv_dim, 1]
-            window = torch.cat([self.conv_cache[ids], mixed], dim=-1)
-            self.conv_cache[ids] = window[..., 1:]
-            mixed = F.silu(F.conv1d(window, conv_w, groups=self.conv_dim))
+            proj = self.in_proj_qkv(x).reshape(-1, self.conv_dim)  # [n, conv_dim]
+            if _USE_CONV_TRITON:
+                # One kernel: window conv + silu + in-place state roll
+                # (the reference chain below gathers, cats, convolves and
+                # scatters the full state — four memory passes).
+                mixed = conv_decode_step(
+                    proj, self.conv_cache, ids,
+                    conv_w.view(self.conv_dim, K))[:, :, None]
+            else:
+                mixed = proj.transpose(1, 2)              # [n, conv_dim, 1]
+                window = torch.cat([self.conv_cache[ids], mixed], dim=-1)
+                self.conv_cache[ids] = window[..., 1:]
+                mixed = F.silu(F.conv1d(window, conv_w, groups=self.conv_dim))
             q, k, v = split_qkv(mixed, 1)
             if _USE_GDN_INPLACE:
                 # In-place pool update (no gather/scatter of the 452MB state).

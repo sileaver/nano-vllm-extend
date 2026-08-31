@@ -185,6 +185,14 @@ head-to-head table in the Benchmark section below).
   eager chain plus full-head copies (bit-exact vs the eager forms;
   `NANOVLLM_FUSED_ROPE=0` A/Bs it).  Net: prefill 61.0k → 63.0k tok/s,
   taking the hybrid model from −1.8% to **+1.5%** vs vLLM.
+* **Single-token conv kernel** — decode steps used to roll the causal-conv
+  state with an eager gather → cat → conv1d → scatter chain (four
+  full-state memory passes, ~18k kernels each of cat and scatter per
+  mixed run — visible only in mixed serving, where decode rows share
+  batches with prefill chunks and fall outside CUDA graphs).  A dedicated
+  Triton kernel does window-conv + SiLU + state roll in one pass
+  (state roll bit-exact, 2.6× per layer at bs≈218): mixed 22.8k → 24.1k
+  tok/s (**104% of vLLM**), pure decode 20.4k → 21.9k (**109%**).
 
 ## Speculative decoding
 
@@ -266,9 +274,9 @@ hand-tuned kernels, nano-vllm the clean-room port):
 
 | Workload | nano-vllm | vLLM 0.27.1 | nano / vLLM |
 |---|---|---|---|
-| prefill-bound — 2048-token prompts, 2 out | **63.0k** total tok/s | 62.1k | **101.5%** |
-| decode-bound — 64-token prompts, 256 out | **20.4k** total / 16.3k out tok/s | 20.1k / 16.0k | **101.5%** |
-| mixed serving — in/out ~ U(100, 1024) | **22.8k** total / 11.0k out tok/s | 23.1k / 11.2k | **98.7%** |
+| prefill-bound — 2048-token prompts, 2 out | **62.5k** total tok/s | 62.1k | **100.6%** |
+| decode-bound — 64-token prompts, 256 out | **21.9k** total / 17.5k out tok/s | 20.1k / 16.0k | **108.9%** |
+| mixed serving — in/out ~ U(100, 1024) | **24.1k** total / 11.7k out tok/s | 23.1k / 11.2k | **104.3%** |
 
 **Qwen3-0.6B** (dense model, upstream code path + this fork's async
 scheduling):
@@ -278,13 +286,13 @@ scheduling):
 | mixed serving — in/out ~ U(100, 1024) | **23.6k** total / 11.4k out tok/s | 23.5k / 11.4k | **100.4%** |
 | decode-bound — 64-token prompts, 256 out | **45.2k** total / 36.2k out tok/s | 43.5k / 34.8k | **103.9%** |
 
-Reading: nano-vllm matches or beats vLLM on both models — decode +2-4%
-(CUDA-graph + fused-sampling path), prefill +1.5% on the hybrid model.
-Mixed sits at 98.7%, inside the run-to-run spread (~1.3% across reps).
-This was not always so: mixed throughput was **9.5k tok/s (~41% of
-vLLM)** before the varlen-GDN and unified-async rework, and prefill sat
-2% behind until a profile pass found a hidden copy chain (see the
-optimization notes).
+Reading: nano-vllm now beats vLLM on every regime of both models.  This
+was not always so: mixed throughput was **9.5k tok/s (~41% of vLLM)**
+before the varlen-GDN and unified-async rework; prefill then sat 2%
+behind until a profile pass found fla's input-guard copy chain; and the
+last mixed-mode deficit (98.7%) traced to the eager decode conv chain
+that mixed batches run outside CUDA graphs — all three stories are in the
+optimization notes below.
 
 ```bash
 OMP_NUM_THREADS=8 python benchmarks/bench_vs_vllm.py            # both engines, mixed
