@@ -4,23 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nano-vllm"
-version = "0.2.0"
-authors = [{ name = "Xingkai Yu" }]
+version = "0.3.0"
+authors = [{ name = "sileaver" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "a lightweight vLLM implementation built from scratch"
+description = "a lightweight vLLM-style inference engine — fork of GeeeekExplorer/nano-vllm extended with hybrid (GDN) models, multimodal, PP/DP and async scheduling"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
     "triton>=3.0.0",
     "transformers>=4.51.0",
-    "flash-attn",
     "xxhash",
+    "pillow",
 ]
 
+[project.optional-dependencies]
+# attention kernels: either works — flash-attn has no wheel on some
+# torch/CUDA combos (e.g. cu13 + sm120), where the vLLM-vendored FA2
+# kernel (vllm.vllm_flash_attn) is used instead.
+flash = ["flash-attn"]
+vllm-fallback = ["vllm"]
+flashinfer = ["flashinfer"]
+
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Upstream = "https://github.com/GeeeekExplorer/nano-vllm"
 
 [tool.setuptools.packages.find]
 where = ["."]
