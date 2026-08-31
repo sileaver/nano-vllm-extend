@@ -2,90 +2,56 @@
 <img width="300" src="assets/logo.png">
 </p>
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+# Nano-vLLM — my extensions
 
-# Nano-vLLM
+A lightweight vLLM-style inference engine, **forked from
+[GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)** (MIT,
+© Xingkai Yu). The upstream snapshot (~1,200 lines: continuous batching, paged
+KV, CUDA graphs, TP, prefix caching) is the `Initial commit` of this repo;
+**everything after it is my work** — ~4,900 added lines implementing a hybrid
+linear-attention model, multimodal inference, pipeline/data parallelism,
+vLLM-V1-style async scheduling, speculative decoding, and a set of
+kernel-level optimizations, each validated against reference implementations.
 
-A lightweight vLLM implementation built from scratch.
+## What I built on top of upstream
 
-## Key Features
+| Area | What | Where | How it's validated |
+|---|---|---|---|
+| **Hybrid model (Qwen3.5-2B)** | Port of the gated-delta-net + sparse-attention hybrid: recurrent-state pooling, causal-conv prefix, partial RoPE with output gates | `nanovllm/models/qwen3_5.py` | `tests/ref_check_qwen35.py` — prefill logits + greedy decode vs transformers |
+| **Multimodal (Qwen3.5 vision)** | Full `Qwen3_5ForConditionalGeneration`: vision tower, embedding scatter, interleaved MRoPE, chunked-prefill-safe staging | `qwen3_5_vision.py`, `utils/multimodal.py`, `MRotaryEmbedding` | `tests/mm_vision_parity_qwen35.py` (29 stages **bit-exact**), `tests/mm_check_qwen35.py` (token-exact vs HF under chunked prefill / mixed batch / TP / PP / async) |
+| **GDN performance** | Varlen prefill (fla chunk kernel + custom varlen causal-conv Triton kernel), fused g/β kernel, in-place recurrent decode (no 450MB state gather/scatter), FlashInfer fused norms | `qwen3_5.py` | bit-equivalence A/B flags (`NANOVLLM_GDN_*`), 8–30× per-layer prefill, ~1.4× decode |
+| **Async scheduling (vLLM V1 style)** | GPU token ring, lagged output processing, optimistic scheduling with output placeholders | `engine/async_scheduler.py`, `model_runner.py` | `tests/async_check.py`; +6–59% decode throughput |
+| **Parallelism** | PP (layer-split stages, fused-residual handoff) and DP (replicated engines, LPT sharding) on top of upstream TP, incl. hybrid-state sharding | `utils/parallel.py`, `engine/*` | `tests/parallel_check.py` — token-identical prefill across tp/pp/dp layouts |
+| **Speculative decoding** | Jacobi parallel draft + classic draft-model + DFlash block-diffusion draft, strict rejection-sampling verification | `model_runner.py`, `models/dflash.py`, `benchmarks/verify_spec.py` | distributional unit tests; honest negative results documented below |
+| **Bug hunts** | Two latent hybrid-engine correctness bugs found & fixed via the multimodal tests (details below) | `block_manager.py`, `model_runner.py` | both reproduced before the fix, green after |
 
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor/Pipeline/Data Parallelism, Torch compilation, CUDA graph, etc.
-
-## Installation
+## Quick start
 
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+pip install -e .          # or: pip install git+https://github.com/<you>/nano-vllm.git
+huggingface-cli download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-0.6B
+python example.py
 ```
 
-## Model Download
+The API mirrors vLLM's (`LLM.generate` returns token ids + text):
 
-To download the model weights manually, use the following command:
-```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
-```
-
-## Quick Start
-
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
 ```python
 from nanovllm import LLM, SamplingParams
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
+outputs = llm.generate(["Hello, Nano-vLLM."],
+                       SamplingParams(temperature=0.6, max_tokens=256))
 outputs[0]["text"]
 ```
 
-## Parallelism (TP / PP / DP)
-
-The three strategies can be combined freely (`dp * pp * tp` ranks, one GPU
-per rank, single node).  Correctness was validated on 2x RTX 5090 against
-single-GPU runs: prefill argmax is token-identical across layouts
-(32/32 real prompts), and generation streams stay within the bf16
-implementation-noise floor (small models have near-tied logits; see
-`tests/real_prompt_check.py`, `tests/parallel_check.py`):
-
-```python
-llm = LLM(path, tensor_parallel_size=2)    # TP: shard heads/neurons per rank
-llm = LLM(path, pipeline_parallel_size=2)  # PP: split layers across stages
-llm = LLM(path, data_parallel_size=2)      # DP: replicas, each own scheduler
-```
-
-* **TP** shards attention/MLP projections, the vocab embedding, the hybrid
-  Qwen3.5 gated-delta-net heads (conv channels + recurrent state) and the
-  KV cache.  Communication: one all-reduce per layer.
-* **PP** splits decoder layers across stages (`dist.send/recv` of the fused
-  hidden+residual chain between stage peers).  Each stage owns only its
-  layers' KV cache / recurrent-state pools — roughly halves per-GPU memory
-  at pp=2.  KV-block and state-slot counts are min-synced across stages so
-  the rank-0 scheduler stays consistent.  Decode CUDA graphs are captured
-  per stage.  v1 runs one batch through the pipeline synchronously (no
-  micro-batch overlap) — use it for capacity, not latency.
-* **DP** replicates the whole engine (scheduler + runners) per GPU group;
-  the driver LPT-bin-packs requests and merges results in order.  Best for
-  offline throughput when the load exceeds one replica's concurrency —
-  measured 1.94x on 512 ragged requests over 2x RTX 5090 (vs 1.38x at 256
-  requests where each replica is batch-starved).
-
-Speculative decoding requires `tp = pp = 1` (it can run under DP — each
-replica speculates independently).  `collect_timing` and step-level
-`add_request`/`step` streaming are single-group only.
+Model paths in examples/tests default to `~/huggingface/...`; override with
+`QWEN35_MODEL=/path` for Qwen3.5 scripts.
 
 ## Multimodal (Qwen3.5 vision)
 
-Qwen3.5 checkpoints ship as multimodal shells; the engine loads the full
-`Qwen3_5ForConditionalGeneration` — vision tower, MRoPE and all.  Image
-prompts follow the same dict form vLLM uses (one
-`<|vision_start|><|image_pad|><|vision_end|>` placeholder per image in
-the text; the checkpoint's own processor expands it to the image's grid
-tokens):
+Qwen3.5 checkpoints ship as multimodal shells; the engine loads the whole
+thing — vision tower, MRoPE and all. Image prompts follow vLLM's dict form
+(one `<|vision_start|><|image_pad|><|vision_end|>` placeholder per image; the
+checkpoint's own processor expands it to the image's grid tokens):
 
 ```python
 prompts = [
@@ -94,152 +60,196 @@ prompts = [
      "images": ["path/or/PIL.Image"]},
     "plain text prompts work on the same engine",
 ]
-outputs = llm.generate(prompts, sampling_params)
+outputs = llm.generate(prompts, sampling_params)   # example_qwen35_mm.py
 ```
 
-Under the hood (`example_qwen35_mm.py`, `tests/mm_check_qwen35.py`):
+Under the hood:
 
-* The **vision tower** (Qwen3-VL style ViT: Conv3d patch embed, learned
-  position table bilinearly resampled per image grid, per-frame
-  non-causal flash attention under 2D rope, 2x2 patch merger) is ported
-  in `nanovllm/models/qwen3_5_vision.py` — bit-exact against the
-  transformers reference at every stage in fp32
-  (`tests/mm_vision_parity_qwen35.py`).  It is replicated across TP
+* The **vision tower** (Qwen3-VL style ViT: Conv3d patch embed, a learned
+  position table bilinearly resampled per image grid, per-frame non-causal
+  flash attention under 2D rope, 2×2 patch merger) is ported in
+  `nanovllm/models/qwen3_5_vision.py` — **bit-exact against the transformers
+  reference at every one of 29 stages** in fp32. It is replicated across TP
   ranks and lives on the first pipeline stage; merged patch embeddings
-  replace `image_token_id` rows after the (all-reduced) token embedding,
-  one vision-tower forward per sequence however many chunks its prefill
+  replace `image_token_id` rows after the (all-reduced) token embedding —
+  one vision-tower forward per sequence, however many chunks its prefill
   splits into.
-* **Interleaved MRoPE** (`MRotaryEmbedding`) — prefill carries [3, N]
-  T/H/W positions over image regions (the port of `get_rope_index` lives
-  in `nanovllm/utils/multimodal.py`); decode collapses back to 1D via
-  the per-sequence `rope_delta`, so CUDA-graph decode replays unchanged.
-* Text-only mode: `NANOVLLM_QWEN35_TEXTONLY=1` skips the tower (the
-  previous behaviour).  Note that hash-based prefix caching is disabled
-  for hybrid (GDN) models — the recurrent state is not reconstructible
-  from cached KV blocks, so a repeated prompt must prefill from scratch.
+* **Interleaved MRoPE** (`MRotaryEmbedding`) — prefill carries [3, N] T/H/W
+  positions over image regions (the port of `get_rope_index` lives in
+  `utils/multimodal.py`); decode collapses back to 1D via a per-sequence
+  `rope_delta`, so CUDA-graph decode replays are untouched.
+* Pixels travel bf16 (lossless — the reference casts to the tower dtype
+  anyway) and only with prefill states; the TP shm command segment is sized
+  accordingly.
+* `NANOVLLM_QWEN35_TEXTONLY=1` skips the tower (upstream behaviour).
 
-## Async Scheduling (vLLM V1 style)
+### Two latent bugs the multimodal tests uncovered
 
-`async_scheduling=True` pipelines CPU scheduling under GPU execution the
-way vLLM V1's async scheduler does — sampled tokens never round-trip
-through the CPU:
+Both are inherent to *any* hybrid (linear-attention) engine, existed in the
+text path before, and are the kind of thing only cross-implementation parity
+testing surfaces:
 
-* **GPU token ring** — each step's sampled ids stay on the GPU (a small
-  ring of slots).  The next decode step gathers its `input_ids`
-  on-device from the previous step's slot (row map known from scheduler
-  metadata); TP/PP groups move the slot with one NCCL broadcast.
-* **Lagging output processing** — results return via an async D2H into
-  pinned memory guarded by a CUDA event.  The engine polls events at the
-  start of each iteration and applies outputs one to two steps late,
-  entirely off the critical path.  Steady-state decode never blocks the
-  CPU on the GPU (pipeline depth capped at 2).
-* **Optimistic scheduling** — KV slots for in-flight tokens are reserved
-  via output placeholders (vLLM's "future token ids"), and a sequence
-  that hits EOS runs one extra wasted row before the CPU notices; its
-  blocks/state are released when the last step referencing it completes.
-* **Synchronous fallback** — prefill-containing batches (and preemption,
-  which accompanies them) drain the pipeline and run synchronously, so
-  chunk accounting always sees a caught-up scheduler.
+1. **Prefix-cache reuse corrupts hybrid state.** Hash-matched KV blocks let a
+   repeated prompt resume prefill mid-sequence, but a GDN layer's recurrent
+   state is not reconstructible from cached KV — the continuation silently
+   diverged. Fix: disable hash-based prefix reuse for hybrid models
+   (`BlockManager(enable_prefix_cache=False)`), the same choice vLLM makes
+   for mamba-style layers.
+2. **CUDA-graph pad rows poisoned a live slot.** Replaying a graph at
+   `bs <` captured size leaves stale rows carrying capture-time
+   `linear_state_ids = 0` — a *real* slot — so the in-place recurrent kernel
+   corrupted that sequence's state every replayed step (only the slot-0
+   sequence diverged, only with graphs on). Fix: a dedicated dummy slot that
+   pad/capture rows point at (the paged-KV write already had the analogous
+   `-1` guard).
 
-Measured on RTX 5090 (decode-bound load): Qwen3-0.6B @ bs=64
-20.1k → 22.6k tok/s (+11.6%), Qwen3.5-2B @ bs=64 10.2k → 11.1k tok/s,
-and the gain grows with parallelism (more CPU + NCCL launch overhead to
-hide): Qwen3-0.6B @ tp2 11.9k → 19.0k tok/s (+59%), Qwen3.5-2B @ tp2
-10.1k → 11.4k tok/s (+11.7%).  After this, decode is GPU-bound: the
-remaining per-step time is the CUDA graph replay plus the memory-bound
-lm-head GEMM.
+## Parallelism (TP / PP / DP)
 
-The hybrid-model (Qwen3.5) optimizations bring nano-vllm to parity with
-vLLM 0.27 on ragged serving workloads (mixed 9.5k → 22.4k tok/s vs
-23.3k, prefill 33.6k → 62.8k vs 62.5k, decode within 3-5%):
+Freely combinable (`dp * pp * tp` ranks, one GPU per rank, single node).
+Correctness validated on 2× RTX 5090 against single-GPU runs — prefill argmax
+is token-identical across layouts (32/32 real prompts; see
+`tests/parallel_check.py`, `tests/real_prompt_check.py`):
 
-* **Varlen GDN** — the gated-delta-net layer used to pad batches to
-  `[bs, max_query_len]`, wasting up to ~150× compute on mixed
-  decode+prefill steps.  Decode rows take the O(1) recurrent path;
-  prefill groups run fully varlen (dense `[N, H]` projections, a varlen
-  causal-conv Triton kernel, and the fla chunk kernel driven by
-  `cu_seqlens` — verified bit-equivalent to the padded call).
-* **Fused GDN plumbing** — a fused g/beta kernel replaces the eager
-  fp32 elementwise chain; the Gemma-style norms and MLP activation run
-  on FlashInfer's fused kernels (`gemma_rmsnorm` /
-  `gemma_fused_add_rmsnorm` / `silu_and_mul`); the decode CUDA graphs
-  capture lm_head + a two-stage fused gumbel-max sampling kernel.
-* **Unified async scheduling** — every scheduled row (prefill chunks
-  included) reserves output placeholders, so prefill batches flow
-  through the same non-draining pipeline as decode: chunk continuation,
+```python
+llm = LLM(path, tensor_parallel_size=2)    # TP: shard heads/neurons per rank
+llm = LLM(path, pipeline_parallel_size=2)  # PP: split layers across stages
+llm = LLM(path, data_parallel_size=2)      # DP: replicas, each own scheduler
+```
+
+* **TP** shards attention/MLP projections, the vocab embedding, the GDN
+  heads (conv channels + recurrent state at v-head granularity) and the KV
+  cache; one all-reduce per layer.
+* **PP** splits decoder layers across stages (`dist.send/recv` of the fused
+  hidden+residual chain between stage peers). Each stage owns only its
+  layers' KV/recurrent-state pools — roughly halves per-GPU memory at pp=2;
+  block/slot counts are min-synced across stages; decode CUDA graphs are
+  captured per stage. v1 runs one batch through synchronously (no
+  micro-batch overlap) — use it for capacity, not latency.
+* **DP** replicates the whole engine per GPU group; the driver LPT-bin-packs
+  requests and merges results in order — 1.94× on 512 ragged requests over
+  2× RTX 5090 (vs 1.38× at 256, where replicas are batch-starved).
+
+Speculative decoding requires `tp = pp = 1` (it runs under DP). Step-level
+`add_request`/`step` streaming and `collect_timing` are single-group only.
+
+## Async scheduling (vLLM V1 style)
+
+`async_scheduling=True` pipelines CPU scheduling under GPU execution —
+sampled tokens never round-trip through the CPU:
+
+* **GPU token ring** — sampled ids stay on the GPU; the next decode step
+  gathers its input ids on-device from the previous step's slot, moved
+  across TP/PP with one NCCL broadcast.
+* **Lagging output processing** — results return via async D2H into pinned
+  memory guarded by a CUDA event; the engine applies them 1–2 steps late,
+  off the critical path (pipeline depth capped at 2).
+* **Optimistic scheduling** — KV slots for in-flight tokens are reserved via
+  output placeholders (vLLM's "future token ids"); a sequence hitting EOS
+  runs one wasted row before the CPU notices.
+* **Unified pipeline** — prefill chunks reserve placeholders too, so they
+  flow through the same non-draining pipeline: chunk continuation,
   decode-on-top-of-unreaped-prefill and mixed-batch input gathering all
   fall out of one `num_computed_tokens` invariant.
 
-## Speculative Decoding
+Measured on RTX 5090 (decode-bound): Qwen3-0.6B @ bs=64 20.1k → 22.6k tok/s
+(+11.6%), Qwen3.5-2B @ bs=64 10.2k → 11.1k tok/s; gains grow with
+parallelism (more CPU/NCCL overhead to hide): Qwen3-0.6B @ tp2 11.9k → 19.0k
+(+59%), Qwen3.5-2B @ tp2 10.1k → 11.4k (+11.7%).
 
-Two modes, both gated by `num_spec_tokens=K` and verified by strict
-per-position rejection sampling (the accepted sequence distribution is
-guaranteed to match ordinary autoregressive sampling; see `verify_spec.py`):
+Together with the GDN optimizations below this reaches parity with vLLM 0.27
+on ragged serving workloads (mixed 9.5k → 22.4k tok/s vs 23.3k, prefill
+33.6k → 62.8k vs 62.5k, decode within 3–5%).
+
+## Hybrid-model (GDN) optimizations
+
+* **Varlen GDN** — the layer used to pad batches to `[bs, max_query_len]`,
+  wasting up to ~150× compute on mixed decode+prefill steps. Decode rows
+  take the O(1) recurrent path; prefill groups run fully varlen (dense
+  `[N, H]` projections, a varlen causal-conv Triton kernel, and the fla
+  chunk kernel driven by `cu_seqlens` — verified bit-equivalent to the
+  padded call).
+* **Fused plumbing** — a fused g/β Triton kernel replaces the eager fp32
+  elementwise chain; Gemma-style norms and the MLP activation run on
+  FlashInfer fused kernels; decode CUDA graphs capture lm_head + a
+  two-stage fused gumbel-max sampling kernel.
+* **In-place recurrent decode** — the decode step used to gather a 450MB
+  state batch, run the recurrent, and scatter back; a custom kernel now
+  indexes pool rows directly (~40% of decode time saved at bs≈218).
+
+## Speculative decoding
+
+Two modes, gated by `num_spec_tokens=K`, verified by strict per-position
+rejection sampling (accepted-sequence distribution provably matches plain
+autoregressive sampling; `benchmarks/verify_spec.py`):
 
 ```python
-# 1. Jacobi-style parallel draft (no draft model): the target itself runs
-#    one K-row forward to propose K candidates.
-llm = LLM("/YOUR/MODEL/PATH", num_spec_tokens=4)
-
-# 2. Classic draft-model speculation: a small model (same tokenizer/vocab)
-#    runs K sequential autoregressive drafts, verified by the target.
-llm = LLM("/YOUR/TARGET/PATH", num_spec_tokens=4,
-          spec_draft_model="/YOUR/DRAFT/PATH")
+llm = LLM(path, num_spec_tokens=4)                      # Jacobi parallel draft
+llm = LLM(target, num_spec_tokens=4, spec_draft_model=draft)  # draft model
 ```
 
-Notes on the models tested locally (16GB RTX 5080):
+Honest negative results (documented, not hidden):
 
-* **Correctness** is verified for all modes: synthetic-distribution unit
-  tests of the acceptance kernel, draft-vs-standalone logits are bitwise
-  identical, and per-position frequency comparison against non-speculative
-  sampling stays at the measured noise floor.
-* **Layer-skipped self-speculation does not work on 0.6B/4B** — skipping
-  even one layer drops the draft/target match rate from ~0.5 to ~0.14 (no
-  layer redundancy). The layer-skip path is kept as a model capability
-  (`Qwen3Model.forward(skip_layers=...)`) for larger models.
-* **No throughput win on 0.6B/4B**: Jacobi draft is 2-4x slower than the
-  CUDA-graph baseline; 0.6B→4B draft-model speculation reaches only
-  0.05-0.13 acceptance (the draft is too small — the ~10x size ratio used
-  in the literature needs a 7B+ target and a properly sized draft). Each
-  speculative step pays two multi-row forwards plus 151k-vocab softmaxes
-  while a 4B decode token is still cheap — the pipeline pays off on larger
-  models, where it is plug-and-play via `spec_draft_model`.
-* **DFlash (z-lab block-diffusion draft) is ported and integrated**
-  (`nanovllm/models/dflash.py`, auto-detected via the draft config), and
-  the official transformers implementation was also benchmarked on this
-  machine for reference (`run_dflash_official.py`).  Official numbers:
-  acceptance 0.53-0.58 on the README chat prompt (~140 tok/s, ~6x the
-  non-speculative baseline) but only 0.18-0.20 on free-form continuation
-  — DFlash's acceptance is strongly prompt-dependent.  nano-vllm's
-  ported draft matches the official implementation bit-for-bit on
-  identical inputs and generates correct text, but its acceptance rate
-  collapses to 0.02-0.04 (10-13x below the official rate on the same
-  prompts).  Root cause: the target's hidden states (which the draft
-  uses as KV context) diverge from transformers' bf16 hidden states in
-  deep layers — a 0.125 divergence at layer 5 amplifies 128x in layer 6's
-  attention and explodes in the residual sum.  This is an inherent limit
-  of a bf16 reimplementation that does not replicate transformers' exact
-  rounding order, not a correctness bug (final logits match HF to 0.19
-  max diff).
+* **No win at 0.6B–4B scale**: Jacobi drafting is 2–4× slower than the
+  CUDA-graph baseline; 0.6B→4B draft speculation only reaches 0.05–0.13
+  acceptance. The pipeline pays two multi-row forwards + 151k-vocab
+  softmaxes per step — it needs a 7B+ target to pay off.
+* **Layer-skipped self-speculation fails**: skipping one layer drops draft
+  match from ~0.5 to ~0.14 — these models have no layer redundancy.
+* **DFlash block-diffusion draft ported and integrated**
+  (`models/dflash.py`) — bit-identical to the official implementation on
+  identical inputs, but acceptance collapses 10–13× below official on the
+  same prompts: the draft consumes the *target's* hidden states as context,
+  and bf16 reimplementation rounding differences (invisible in final
+  logits) amplify through its attention. Documented as an inherent limit of
+  non-bit-identical reimplementations, with the amplification chain
+  measured layer by layer.
+
+## Project structure
+
+```
+nanovllm/
+├── engine/            # scheduler (legacy/continuous/async), model runner,
+│                      #   block manager, shm-broadcast worker loop
+├── layers/            # attention (paged KV + flash varlen), rope/MRoPE,
+│                      #   parallel linear, sampler (+ gumbel triton kernel)
+├── models/            # qwen3 (dense), qwen3_5 (hybrid GDN + attention),
+│                      #   qwen3_5_vision (ViT tower), dflash (draft)
+└── utils/             # loader, parallel state, multimodal preprocessing
+benchmarks/            # throughput benches (nano vs vLLM), spec verification
+tests/                 # parity checks vs transformers / across parallel
+                      #   layouts / async; ref_mm/ regenerates the
+                      #   multimodal golden reference
+example*.py            # text, hybrid-model and multimodal usage
+```
+
+## Validation
+
+Every subsystem has a runnable check against a reference implementation
+(all green on 2× RTX 5090, torch 2.13 / cu130):
+
+```bash
+python tests/ref_check_qwen35.py          # hybrid LM: prefill logits + greedy decode vs HF
+python tests/ref_mm/gen_reference.py      # regenerate multimodal golden reference (~310MB, gitignored)
+python tests/mm_vision_parity_qwen35.py   # vision tower: 29 stages bit-exact vs HF (fp32)
+python tests/mm_check_qwen35.py           # multimodal e2e: token-exact vs HF under chunked
+                                          #   prefill with the boundary inside the image region
+python tests/parallel_check.py            # tp/pp/dp layouts vs single GPU
+python tests/async_check.py               # async scheduler output equivalence
+```
+
+`tests/smoke_check_qwen35.py` (random weights, loose thresholds) also runs;
+its pass rate is unchanged by this work.
 
 ## Benchmark
 
-See `bench.py` for benchmark.
+Upstream reference numbers (RTX 4070 laptop, Qwen3-0.6B, 256 requests of
+100–1024 in/out): nano-vllm **1434 tok/s** vs vLLM **1362 tok/s**. This
+fork's own numbers on RTX 5090 are quoted inline in the sections above;
+reproduce them with `benchmarks/bench1.py` (nano) vs `benchmarks/bench.py`
+(vLLM baseline), `benchmarks/bench_vs_vllm.py` (head-to-head ragged serving)
+and `benchmarks/bench_parallel.py`.
 
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
+## License
 
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
-
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+MIT — upstream © 2025 Xingkai Yu ([GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm));
+modifications in this fork © 2026 sileaver.
