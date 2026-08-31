@@ -28,9 +28,13 @@
 ## 快速开始
 
 ```bash
-pip install -e .          # 或:pip install git+https://github.com/<你>/nano-vllm.git
+# attention 内核:flash-attn wheel,或 vLLM 内置的 FA2 内核
+# (部分 torch/CUDA 组合没有 flash-attn wheel,如 cu13 + sm120)
+pip install -e ".[flash]"            # 你的环境有 flash-attn wheel 时
+pip install -e ".[vllm-fallback]"    # 否则:安装 vllm,使用 vllm.vllm_flash_attn
+
 huggingface-cli download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-0.6B
-python example.py
+python example.py                    # 或:pip install git+https://github.com/sileaver/nano-vllm-extend.git
 ```
 
 API 与 vLLM 对齐(`LLM.generate` 返回 token id + 文本):

@@ -30,9 +30,13 @@ kernel-level optimizations, each validated against reference implementations.
 ## Quick start
 
 ```bash
-pip install -e .          # or: pip install git+https://github.com/<you>/nano-vllm.git
+# attention kernels: a flash-attn wheel, OR vLLM's vendored FA2 kernel
+# (no flash-attn wheel exists for some torch/CUDA combos, e.g. cu13 + sm120)
+pip install -e ".[flash]"            # if a flash-attn wheel exists for your stack
+pip install -e ".[vllm-fallback]"    # otherwise: pulls vllm, uses vllm.vllm_flash_attn
+
 huggingface-cli download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-0.6B
-python example.py
+python example.py                    # or: pip install git+https://github.com/sileaver/nano-vllm-extend.git
 ```
 
 The API mirrors vLLM's (`LLM.generate` returns token ids + text):
