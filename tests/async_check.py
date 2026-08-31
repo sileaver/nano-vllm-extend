@@ -19,9 +19,7 @@ import torch
 
 from nanovllm import LLM, SamplingParams
 
-MODEL = os.path.expanduser("~/huggingface/Qwen3.5-2B")
-if not os.path.isdir(MODEL):
-    MODEL = "/root/autodl-tmp/huggingface/Qwen3.5-2B"
+MODEL = os.environ.get("QWEN35_MODEL", os.path.expanduser("~/huggingface/Qwen3.5-2B"))
 
 PROMPTS = [
     "The capital of France is",

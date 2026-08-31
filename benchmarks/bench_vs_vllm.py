@@ -14,6 +14,10 @@ async scheduling), both get a shape-matched warmup before the timed reps
 Each engine is a separate subprocess (own CUDA context, no teardown
 interference); startup takes ~1-3 min per engine, the timed part is 3 reps.
 """
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 import os
 import subprocess

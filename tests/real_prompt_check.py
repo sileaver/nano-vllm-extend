@@ -24,7 +24,7 @@ PROMPTS = [
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "single"
-    model = sys.argv[2] if len(sys.argv) > 2 else "/root/huggingface/Qwen3.5-2B"
+    model = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser("~/huggingface/Qwen3.5-2B")
     # T=1e-6 ~ true greedy: gumbel noise (O(1)) is negligible against
     # logits/T (O(1e6)), so only actual argmax changes flip tokens.
     sp = SamplingParams(temperature=1e-6, max_tokens=24)

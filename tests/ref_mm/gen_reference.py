@@ -5,14 +5,15 @@ prompt (prefill logits + 8 greedy tokens), and saves the processed inputs
 plus the source image so tests/mm_check_qwen35.py can replay the exact
 batch through nano-vllm.
 """
+import os
 import sys
 import numpy as np
 import torch
 from PIL import Image
 from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
-MODEL = "/root/autodl-tmp/huggingface/Qwen3.5-2B"
-OUT = "tests/ref_mm"
+MODEL = os.environ.get("QWEN35_MODEL", os.path.expanduser("~/huggingface/Qwen3.5-2B"))
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "")
 
 rng = np.random.default_rng(42)
 img = Image.fromarray(rng.integers(0, 256, (448, 672, 3), dtype=np.uint8))

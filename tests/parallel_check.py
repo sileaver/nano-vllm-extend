@@ -18,7 +18,7 @@ from random import randint, seed
 
 from nanovllm import LLM, SamplingParams
 
-MODEL = "/root/huggingface/Qwen3.5-2B"
+MODEL = os.environ.get("QWEN35_MODEL", os.path.expanduser("~/huggingface/Qwen3.5-2B"))
 NUM_SEQS = 8
 MAX_INPUT = 256
 MAX_OUTPUT = 32

@@ -18,7 +18,7 @@ MODES = {
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "single"
-    model = sys.argv[2] if len(sys.argv) > 2 else "/root/huggingface/Qwen3.5-2B"
+    model = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser("~/huggingface/Qwen3.5-2B")
     num_seqs = int(sys.argv[3]) if len(sys.argv) > 3 else 256
     seed(0)
     max_input_len, max_ouput_len = 1024, 1024

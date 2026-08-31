@@ -192,4 +192,11 @@ cython_debug/
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
-.cursorindexingignoretests/ref_mm/img_prompt.pt
+.cursorindexingignore
+
+# Project-local artifacts
+# multimodal parity reference (310MB; regenerate with tests/ref_mm/gen_reference.py)
+tests/ref_mm/img_prompt.pt
+
+# Claude Code local settings
+.claude/

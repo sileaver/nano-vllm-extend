@@ -13,19 +13,20 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 
 import torch
 
-sys.path.insert(0, "/home/a/huggingface/Qwen3-4B-DFlash-b16")
+sys.path.insert(0, os.path.expanduser("~/huggingface/Qwen3-4B-DFlash-b16"))
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from modeling_dflash import (DFlashDraftModel, extract_context_feature,
                              sample)
 
-TARGET_PATH = "/home/a/huggingface/Qwen3-4B"
-DRAFT_PATH = "/home/a/huggingface/Qwen3-4B-DFlash-b16"
+TARGET_PATH = os.path.expanduser("~/huggingface/Qwen3-4B")
+DRAFT_PATH = os.path.expanduser("~/huggingface/Qwen3-4B-DFlash-b16")
 EOS = 151645  # <|im_end|>
 
 

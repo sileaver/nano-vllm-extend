@@ -1,6 +1,10 @@
 """bench1 风格的投机解码吞吐对比: K = 0 (基线) vs 4 vs 8."""
 import os
 import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import os
+import sys
 import time
 import torch
 from random import randint, seed

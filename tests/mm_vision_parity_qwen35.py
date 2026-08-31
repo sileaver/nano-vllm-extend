@@ -8,9 +8,11 @@ the bf16 flash-attn path is covered end-to-end by mm_check_qwen35.py.
 
 Usage: python tests/mm_vision_parity_qwen35.py
 """
-import sys, torch
+import os, sys, torch
 import torch.nn.functional as F
-sys.path.insert(0, "/root/autodl-tmp/nano-vllm")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+MODEL = os.environ.get("QWEN35_MODEL", os.path.expanduser("~/huggingface/Qwen3.5-2B"))
+HERE = os.path.dirname(os.path.abspath(__file__))
 from nanovllm.models.qwen3_5_vision import (
     Qwen3_5VisionModel, _pos_embed_interp_indices, _vision_position_ids,
     _vision_cu_seqlens)
@@ -19,10 +21,10 @@ from transformers.vision_utils import get_vision_interpolation_indices_and_weigh
 from nanovllm.utils.loader import load_model
 
 torch.set_grad_enabled(False)
-ref_data = torch.load("/root/autodl-tmp/nano-vllm/tests/ref_mm/img_prompt.pt", weights_only=False)
-vcfg = AutoConfig.from_pretrained("/root/autodl-tmp/huggingface/Qwen3.5-2B").vision_config
+ref_data = torch.load(os.path.join(HERE, "ref_mm/img_prompt.pt"), weights_only=False)
+vcfg = AutoConfig.from_pretrained(MODEL).vision_config
 full = Qwen3_5ForConditionalGeneration.from_pretrained(
-    "/root/autodl-tmp/huggingface/Qwen3.5-2B", dtype=torch.float32).eval().cuda()
+    MODEL, dtype=torch.float32).eval().cuda()
 vis = full.model.visual
 pv = ref_data["pixel_values"].cuda().float()
 grid = ref_data["image_grid_thw"].cuda()
@@ -33,7 +35,7 @@ torch.set_default_device("cuda")
 ours = Qwen3_5VisionModel(vcfg)
 ours.weight_remapping = (("model.visual.", ""),)
 ours.ignored_weight_prefixes = ("mtp.", "model.language_model.", "lm_head.")
-load_model(ours, "/root/autodl-tmp/huggingface/Qwen3.5-2B")
+load_model(ours, MODEL)
 
 def math_attn(attn_mod, x, cu, cos, sin, num_heads, head_dim):
     total = x.size(0)

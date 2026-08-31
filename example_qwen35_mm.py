@@ -1,13 +1,17 @@
-import torch
+import os
 
 from nanovllm import LLM, SamplingParams
+
+# Any Qwen3.5 checkpoint works (multimodal shell or not); override with
+# QWEN35_MODEL=/path if it does not live in ~/huggingface.
+MODEL = os.environ.get("QWEN35_MODEL", os.path.expanduser("~/huggingface/Qwen3.5-2B"))
 
 
 def main():
     # Any Qwen3.5 checkpoint ships the full multimodal shell; the engine
     # loads the vision tower alongside the language model (set
     # NANOVLLM_QWEN35_TEXTONLY=1 to skip it).
-    llm = LLM(model="/root/autodl-tmp/huggingface/Qwen3.5-2B",
+    llm = LLM(model=MODEL,
               max_model_len=4096, gpu_memory_utilization=0.9)
     sampling_params = SamplingParams(temperature=0.7, max_tokens=256)
 

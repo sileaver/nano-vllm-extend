@@ -4,14 +4,18 @@ Counterpart to run_dflash_official.py: same prompt (official README math
 question, thinking disabled), same temperature, nano-vllm's ported DFlash
 draft.  Compares against the official transformers numbers.
 """
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import time
 import torch
 
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
-TARGET_PATH = "/home/a/huggingface/Qwen3-4B"
-DRAFT_PATH = "/home/a/huggingface/Qwen3-4B-DFlash-b16"
+TARGET_PATH = os.path.expanduser("~/huggingface/Qwen3-4B")
+DRAFT_PATH = os.path.expanduser("~/huggingface/Qwen3-4B-DFlash-b16")
 
 tokenizer = AutoTokenizer.from_pretrained(TARGET_PATH)
 chat_prompt = tokenizer.apply_chat_template(
