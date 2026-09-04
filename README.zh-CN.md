@@ -19,7 +19,7 @@
 |---|---|---|---|
 | **混合模型(Qwen3.5-2B)** | 移植 gated-delta-net + 稀疏注意力混合架构:循环状态池化、因果卷积前缀、带输出门的 partial RoPE | `nanovllm/models/qwen3_5.py` | `tests/ref_check_qwen35.py` —— prefill logits + greedy 解码对照 transformers |
 | **多模态(Qwen3.5 视觉)** | 完整 `Qwen3_5ForConditionalGeneration`:视觉塔、embedding scatter、交错式 MRoPE、跨 chunk 安全的图像暂存 | `qwen3_5_vision.py`、`utils/multimodal.py`、`MRotaryEmbedding` | `tests/mm_vision_parity_qwen35.py`(29 个阶段**位级一致**)、`tests/mm_check_qwen35.py`(分块 prefill / 混合批 / TP / PP / async 下与 HF 逐 token 一致) |
-| **GDN 性能** | varlen prefill(fla chunk 内核 + 自研 varlen 因果卷积 Triton 内核)、融合 g/β 内核、原地循环解码(免去 450MB 状态 gather/scatter)、FlashInfer 融合归一化 | `qwen3_5.py` | 位级等价 A/B 开关(`NANOVLLM_GDN_*`);单层 prefill 8–30×,decode 约 1.4× |
+| **GDN 性能** | varlen prefill(fla chunk 内核 + varlen 因果卷积 Triton 内核)、融合 g/β 内核、原地循环解码(免去 450MB 状态 gather/scatter)、FlashInfer 融合归一化 | `qwen3_5.py` | 位级等价 A/B 开关(`NANOVLLM_GDN_*`);单层 prefill 8–30×,decode 约 1.4× |
 | **异步调度(vLLM V1 风格)** | GPU token 环、滞后输出处理、输出占位符式乐观调度 | `engine/async_scheduler.py`、`model_runner.py` | `tests/async_check.py`;decode 吞吐 +6~59% |
 | **并行** | 在上游 TP 之上实现 PP(按层切分、融合残差传递)与 DP(引擎复制、LPT 装箱),含混合模型状态切分 | `utils/parallel.py`、`engine/*` | `tests/parallel_check.py` —— tp/pp/dp 各布局 prefill 逐 token 一致 |
 | **投机解码** | Jacobi 并行草稿 + 经典草稿模型 + DFlash 块扩散草稿,严格逐位置拒绝采样验证 | `model_runner.py`、`models/dflash.py`、`benchmarks/verify_spec.py` | 分布单元测试;负面结果如实记录(见下) |
@@ -154,7 +154,7 @@ Qwen3.5-2B @ bs=64 10.2k → 11.1k tok/s;并行度越高收益越大(有更多 C
   与 MLP 激活跑在 FlashInfer 融合内核上;decode CUDA graph 一并捕获 lm_head +
   两段式融合 gumbel-max 采样内核。
 * **原地循环解码** —— decode 步原来要 gather 450MB 状态批、跑循环、再 scatter
-  回去;自研内核直接按池行号原地更新(bs≈218 时省下约 40% decode 时间)。
+  回去;改为按池行号原地更新的专用内核(bs≈218 时省下约 40% decode 时间)。
 * **零拷贝 GDN prefill 管线** —— 对照 vLLM 做 profile 发现 fla chunk 内核的输入
   守卫在重复拷贝 q/k/v(每层 3×64MB,约占 prefill 时间 1.7%):varlen 因果卷积
   内核现在把输出写为三块各自连续的 `[N, H, D]`,下游零拷贝。RoPE 与 attention
